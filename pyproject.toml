@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ipca"
+version = "2.0.0"
+description = "Instrumented Principal Components Analysis (Kelly, Pruitt, and Su 2019)"
+authors = [{ name = "Seth Pruitt" }]
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+]
+
+[project.urls]
+Homepage = "https://www.sethpruitt.net"
+Repository = "https://github.com/sjpsjpsjp/ipca"
+
+[tool.setuptools]
+py-modules = ["ipca"]
