@@ -2,7 +2,7 @@
 IPCA: Instrumented Principal Components Analysis
 Estimation class for Kelly, Pruitt, and Su (2019 JFE)
 
-version 2.0.0
+version 2.0.1
 
 copyright Seth Pruitt (2020-2026)
 """
@@ -518,11 +518,12 @@ class ipca(object):
             # computed via a single matrix multiply (no per-t loop).
             if K_tan > 0:
                 F_tan = Factor_arr[:K_tan, :]           # (K_tan, T)
-                S_tan = np.atleast_2d(np.cov(F_tan))   # (K_tan, K_tan)
                 iota  = np.ones(K_tan)
                 try:
                     if factor_mean == 'constant':
-                        # Static weights — unchanged from original behaviour
+                        # Static weights — S from raw factors (constant mean, so
+                        # cov(F) == cov(F - mean) up to ddof; no time-varying correction needed)
+                        S_tan   = np.atleast_2d(np.cov(F_tan))   # (K_tan, K_tan)
                         mu_tan  = F_tan.mean(axis=1)    # (K_tan,)
                         Sinv_mu = np.linalg.solve(S_tan, mu_tan)
                         denom   = iota @ Sinv_mu
@@ -538,6 +539,10 @@ class ipca(object):
                             TanPtf = pd.Series(np.nan, index=self.Dates)
                     else:
                         # Time-varying weights: mu_t = LambdaV[:K_tan, t]
+                        # S is estimated from prediction residuals, not raw factors:
+                        # conditional covariance = Cov(F - LambdaV), not Cov(F).
+                        resid_tan    = F_tan - LambdaV[:K_tan, :]         # (K_tan, T)
+                        S_tan        = np.atleast_2d(np.cov(resid_tan))   # (K_tan, K_tan)
                         # Vectorised: precompute S^{-1}, then broadcast across T.
                         Sinv         = np.linalg.inv(S_tan)               # (K_tan, K_tan)
                         Mu_all       = LambdaV[:K_tan, :]                 # (K_tan, T)
@@ -754,15 +759,29 @@ class ipca(object):
                         Gamma0[:, const_col] @ np.linalg.solve(Wt, Xt))
 
                 # Factor mean forecast (Lambda at t) — known before t is observed
+                # mu_train_tan: training-window fitted values for K_tan factors,
+                # used to form the residual covariance for TanPtf (None for constant).
+                mu_train_tan = None
+
                 if factor_mean == 'constant':
                     lamt = Factor0.mean(axis=1)  # (KM,) training-sample mean
                     Lambda[t] = lamt
                     B = np.hstack((np.zeros((KM, KM)), lamt.reshape(-1, 1))).T
+                    # mu_train_tan stays None: raw cov(F) is correct for constant mean
 
                 elif factor_mean == 'VAR1':
                     B = self._VARB(X=Factor0)
                     lamt = B.T.dot(np.hstack((Factor0[:, -1], 1)).reshape(-1, 1)).ravel()
                     Lambda[t] = lamt
+                    # VAR1 training fitted: B.T @ [F_{t-1}; 1] for t=1..T_tr-1,
+                    # unconditional mean for t=0. Pure matrix multiply — no re-fitting.
+                    if K_tan > 0:
+                        T_tr = Factor0.shape[1]
+                        Ftil = np.vstack([Factor0, np.ones((1, T_tr))])  # (KM+1, T_tr)
+                        _mu_tr = np.empty_like(Factor0)
+                        _mu_tr[:, 0]  = Factor0.mean(axis=1)
+                        _mu_tr[:, 1:] = B.T @ Ftil[:, :-1]              # (KM, T_tr-1)
+                        mu_train_tan  = _mu_tr[:K_tan, :]
 
                 elif factor_mean == 'forecombo':
                     # (a) VAR1 forecast using training-window factors
@@ -774,10 +793,11 @@ class ipca(object):
                         macro_train = MacroData.iloc[t_idx - OOS_window_specs : t_idx]
                     else:  # recursive
                         macro_train = MacroData.iloc[:t_idx]
-                    lamt_mac = self._dispatch_macro_predict(
+                    lamt_mac, mac_train_fitted = self._dispatch_macro_predict(
                         Factor0, macro_train, MacroData.loc[t],
                         regularization, target_variance, alpha,
-                        pass2_intercept)  # (KM,)
+                        pass2_intercept,
+                        return_train_fitted=True)  # (KM,) and (KM, T_train)
                     LambdaM[t] = lamt_mac
 
                     # (c) OLS combination — expanding window over past OOS history
@@ -799,29 +819,51 @@ class ipca(object):
                     oos_mac_hist.append(lamt_mac.copy())
                     oos_fac_hist.append(F_t.copy())
 
+                    # Combined training fitted values for TanPtf residual covariance:
+                    # VAR1 training fitted (matrix multiply, no re-fitting)
+                    if K_tan > 0:
+                        T_tr = Factor0.shape[1]
+                        Ftil = np.vstack([Factor0, np.ones((1, T_tr))])  # (KM+1, T_tr)
+                        var_train = np.empty_like(Factor0)
+                        var_train[:, 0]  = Factor0.mean(axis=1)
+                        var_train[:, 1:] = B.T @ Ftil[:, :-1]           # (KM, T_tr-1)
+                        # OLS combination over training window
+                        _combo_train = np.zeros_like(Factor0)
+                        for _k in range(KM):
+                            _Xc = np.column_stack([
+                                np.ones(T_tr), var_train[_k, :], mac_train_fitted[_k, :]])
+                            _wc = np.linalg.lstsq(_Xc, Factor0[_k, :], rcond=None)[0]
+                            _combo_train[_k, :] = _Xc @ _wc
+                        mu_train_tan = _combo_train[:K_tan, :]
+
                 elif factor_mean == 'macro':
                     # Macro-only: no VAR(1), no combination step
                     if OOS_window == 'rolling':
                         macro_train = MacroData.iloc[t_idx - OOS_window_specs : t_idx]
                     else:  # recursive
                         macro_train = MacroData.iloc[:t_idx]
-                    lamt = self._dispatch_macro_predict(
+                    lamt, mac_train_fitted = self._dispatch_macro_predict(
                         Factor0, macro_train, MacroData.loc[t],
                         regularization, target_variance, alpha,
-                        pass2_intercept)  # (KM,)
+                        pass2_intercept,
+                        return_train_fitted=True)  # (KM,) and (KM, T_train)
                     Lambda[t]  = lamt
                     LambdaM[t] = lamt
                     # B stays None — no VAR component
+                    if K_tan > 0:
+                        mu_train_tan = mac_train_fitted[:K_tan, :]
 
                 fittedX['Fits_Pred'][t] = (Wt @ Gamma0 @ lamt).reshape(-1, 1)
 
                 # TanPtf: tangency portfolio using lamt as the expected-return vector
                 # so that time-varying factor predictions (VAR1, macro, forecombo) drive
                 # the weights rather than the static training-window mean.
+                # S is estimated from prediction residuals (mu_train_tan) so that the
+                # conditional covariance Cov(F - mu) is used, not Cov(F).
                 if K_tan > 0:
                     TanPtf[t] = self._tangency_ptf(
                         Factor0[:K_tan, :], F_t[:K_tan], tan_target_vol,
-                        mu=lamt[:K_tan])
+                        mu=lamt[:K_tan], mu_train=mu_train_tan)
 
                 if R2_bench == 'mean':
                     # per-characteristic mean of _X up to (not including) t
@@ -935,7 +977,7 @@ class ipca(object):
     # Portfolio helpers
     # ------------------------------------------------------------------
 
-    def _tangency_ptf(self, F_train, F_next, target_vol, mu=None):
+    def _tangency_ptf(self, F_train, F_next, target_vol, mu=None, mu_train=None):
         """
         Tangency portfolio return at the next period.
 
@@ -951,6 +993,11 @@ class ipca(object):
                      falls back to the training-sample mean F_train.mean(axis=1).
                      Pass the factor-mean forecast (lamt[:K_tan]) for VAR1/macro so
                      that time-varying predictions drive the portfolio weights.
+        mu_train   : (K_tan, T_train) ndarray or None — training-window conditional
+                     mean forecasts (fitted values from the factor-mean model). When
+                     provided, S is estimated from the prediction residuals
+                     F_train - mu_train rather than from raw F_train. Pass for
+                     VAR1/macro/forecombo; leave None for factor_mean='constant'.
 
         Returns a scalar float, or np.nan when K_tan == 0, fewer than K_tan+1
         training observations are available, or the covariance matrix is singular.
@@ -958,7 +1005,8 @@ class ipca(object):
         K_tan, T_train = F_train.shape
         if K_tan == 0 or T_train <= K_tan:
             return np.nan
-        S    = np.atleast_2d(np.cov(F_train))  # (K_tan, K_tan), ddof=1 matches MATLAB cov()
+        F_for_S = F_train if mu_train is None else F_train - mu_train
+        S    = np.atleast_2d(np.cov(F_for_S))  # (K_tan, K_tan), ddof=1 matches MATLAB cov()
         mu   = F_train.mean(axis=1) if mu is None else mu   # (K_tan,)
         iota = np.ones(K_tan)
         try:
@@ -1505,15 +1553,18 @@ class ipca(object):
     # Factor prediction helpers for factor_mean='forecombo'
     # ------------------------------------------------------------------
 
-    def _predict_factors_with_forecombo_uncon(self, Factor, MacroData_train, MacroData_test):
+    def _predict_factors_with_forecombo_uncon(self, Factor, MacroData_train, MacroData_test,
+                                              return_train_fitted=False):
         """
         Predict latent factors via OLS regression of factors on standardised macro data.
 
-        Factor          : (KM, T_train) ndarray of factor realisations over the training window
-        MacroData_train : df(T_train x P)              macro data aligned with Factor columns
-        MacroData_test  : df(T_test x P) or Series(P,) macro data at prediction date(s)
-        Returns         : (KM, T_test) ndarray if MacroData_test is a DataFrame
-                          (KM,) ndarray       if MacroData_test is a Series
+        Factor              : (KM, T_train) ndarray of factor realisations over the training window
+        MacroData_train     : df(T_train x P)              macro data aligned with Factor columns
+        MacroData_test      : df(T_test x P) or Series(P,) macro data at prediction date(s)
+        return_train_fitted : bool — when True return (test_pred, train_fitted) tuple where
+                              train_fitted is (KM, T_train); otherwise return test_pred only.
+        Returns             : (KM, T_test) ndarray if MacroData_test is a DataFrame
+                              (KM,) ndarray       if MacroData_test is a Series
         """
         X_train = MacroData_train.values.astype(np.float64)
 
@@ -1527,22 +1578,28 @@ class ipca(object):
         if isinstance(MacroData_test, pd.Series):
             x_t   = (MacroData_test.values.astype(np.float64) - mean) / std
             x_aug = np.hstack([1.0, x_t])
-            return (x_aug @ beta).ravel()                         # (KM,)
+            test_pred = (x_aug @ beta).ravel()                    # (KM,)
         else:
             X_test   = MacroData_test.values.astype(np.float64)
             X_test_s = (X_test - mean) / std
             X_test_aug = np.column_stack([np.ones(len(X_test)), X_test_s])
-            return (X_test_aug @ beta).T                          # (KM, T_test)
+            test_pred = (X_test_aug @ beta).T                     # (KM, T_test)
 
-    def _predict_factors_with_forecombo_ridge(self, Factor, MacroData_train, MacroData_test, alpha):
+        if return_train_fitted:
+            return test_pred, (X_aug @ beta).T                    # (KM, T_train)
+        return test_pred
+
+    def _predict_factors_with_forecombo_ridge(self, Factor, MacroData_train, MacroData_test, alpha,
+                                              return_train_fitted=False):
         """
         Predict latent factors via Ridge regression on standardised macro data.
 
-        Factor          : (KM, T_train) ndarray
-        MacroData_train : df(T_train x P)
-        MacroData_test  : df(T_test x P) or Series(P,)
-        alpha           : Ridge penalty strength
-        Returns         : (KM, T_test) or (KM,)
+        Factor              : (KM, T_train) ndarray
+        MacroData_train     : df(T_train x P)
+        MacroData_test      : df(T_test x P) or Series(P,)
+        alpha               : Ridge penalty strength
+        return_train_fitted : bool — when True return (test_pred, train_fitted) tuple.
+        Returns             : (KM, T_test) or (KM,)
         """
         X_train = MacroData_train.values.astype(np.float64)
 
@@ -1555,17 +1612,24 @@ class ipca(object):
         for k in range(KM):
             beta[:, k] = self._ridge_regression(X_train_s, Factor[k, :], lambda_=alpha)
 
+        X_train_aug = np.column_stack([np.ones(X_train.shape[0]), X_train_s])
+
         if isinstance(MacroData_test, pd.Series):
             x_t   = (MacroData_test.values.astype(np.float64) - mean) / std
             x_aug = np.hstack([1.0, x_t])
-            return (x_aug @ beta).ravel()                         # (KM,)
+            test_pred = (x_aug @ beta).ravel()                    # (KM,)
         else:
             X_test   = MacroData_test.values.astype(np.float64)
             X_test_s = (X_test - mean) / std
             X_test_aug = np.column_stack([np.ones(len(X_test)), X_test_s])
-            return (X_test_aug @ beta).T                          # (KM, T_test)
+            test_pred = (X_test_aug @ beta).T                     # (KM, T_test)
 
-    def _predict_factors_with_forecombo_lasso(self, Factor, MacroData_train, MacroData_test, alpha):
+        if return_train_fitted:
+            return test_pred, (X_train_aug @ beta).T              # (KM, T_train)
+        return test_pred
+
+    def _predict_factors_with_forecombo_lasso(self, Factor, MacroData_train, MacroData_test, alpha,
+                                              return_train_fitted=False):
         """
         Predict latent factors via LASSO regression on standardised macro data.
 
@@ -1573,15 +1637,16 @@ class ipca(object):
         least-penalised solution with at most alpha non-zero coefficients is
         selected, giving direct control over the number of active predictors.
 
-        Factor          : (KM, T_train) ndarray
-        MacroData_train : df(T_train x P)
-        MacroData_test  : df(T_test x P) or Series(P,)
-        alpha           : int — target number of active macro predictors.
-                          The least-penalised path solution with at most alpha
-                          non-zero coefficients is used; if the path never
-                          reaches alpha active predictors the densest solution
-                          is used instead.
-        Returns         : (KM, T_test) or (KM,)
+        Factor              : (KM, T_train) ndarray
+        MacroData_train     : df(T_train x P)
+        MacroData_test      : df(T_test x P) or Series(P,)
+        alpha               : int — target number of active macro predictors.
+                              The least-penalised path solution with at most alpha
+                              non-zero coefficients is used; if the path never
+                              reaches alpha active predictors the densest solution
+                              is used instead.
+        return_train_fitted : bool — when True return (test_pred, train_fitted) tuple.
+        Returns             : (KM, T_test) or (KM,)
         """
         X_train = MacroData_train.values.astype(np.float64)
 
@@ -1612,47 +1677,58 @@ class ipca(object):
 
         if isinstance(MacroData_test, pd.Series):
             x_t = (MacroData_test.values.astype(np.float64) - mean) / std
-            return coef_matrix.T @ x_t + intercepts               # (KM,)
+            test_pred = coef_matrix.T @ x_t + intercepts          # (KM,)
         else:
             X_test   = MacroData_test.values.astype(np.float64)
             X_test_s = (X_test - mean) / std
-            return coef_matrix.T @ X_test_s.T + intercepts[:, None]  # (KM, T_test)
+            test_pred = coef_matrix.T @ X_test_s.T + intercepts[:, None]  # (KM, T_test)
+
+        if return_train_fitted:
+            train_fitted = coef_matrix.T @ X_train_s.T + intercepts[:, None]  # (KM, T_train)
+            return test_pred, train_fitted
+        return test_pred
 
     def _predict_factors_with_forecombo_pca(self, Factor, MacroData_train, MacroData_test,
-                                            target_variance):
+                                            target_variance, return_train_fitted=False):
         """PCA pre-processing then OLS prediction."""
         Vt_n, pca_mean, pca_std = self._pca_fit(MacroData_train, target_variance)
         train_red = self._pca_transform(MacroData_train, Vt_n, pca_mean, pca_std)
         test_red  = self._pca_transform(MacroData_test,  Vt_n, pca_mean, pca_std)
-        return self._predict_factors_with_forecombo_uncon(Factor, train_red, test_red)
+        return self._predict_factors_with_forecombo_uncon(
+            Factor, train_red, test_red, return_train_fitted=return_train_fitted)
 
     def _predict_factors_with_forecombo_pca_ridge(self, Factor, MacroData_train, MacroData_test,
-                                                  target_variance, alpha):
+                                                  target_variance, alpha,
+                                                  return_train_fitted=False):
         """PCA pre-processing then Ridge prediction."""
         Vt_n, pca_mean, pca_std = self._pca_fit(MacroData_train, target_variance)
         train_red = self._pca_transform(MacroData_train, Vt_n, pca_mean, pca_std)
         test_red  = self._pca_transform(MacroData_test,  Vt_n, pca_mean, pca_std)
-        return self._predict_factors_with_forecombo_ridge(Factor, train_red, test_red, alpha)
+        return self._predict_factors_with_forecombo_ridge(
+            Factor, train_red, test_red, alpha, return_train_fitted=return_train_fitted)
 
     def _predict_factors_with_forecombo_pca_lasso(self, Factor, MacroData_train, MacroData_test,
-                                                  target_variance, alpha):
+                                                  target_variance, alpha,
+                                                  return_train_fitted=False):
         """PCA pre-processing then LASSO prediction."""
         Vt_n, pca_mean, pca_std = self._pca_fit(MacroData_train, target_variance)
         train_red = self._pca_transform(MacroData_train, Vt_n, pca_mean, pca_std)
         test_red  = self._pca_transform(MacroData_test,  Vt_n, pca_mean, pca_std)
-        return self._predict_factors_with_forecombo_lasso(Factor, train_red, test_red, alpha)
+        return self._predict_factors_with_forecombo_lasso(
+            Factor, train_red, test_red, alpha, return_train_fitted=return_train_fitted)
 
     def _predict_factors_with_forecombo_3prf(self, Factor, MacroData_train, MacroData_test,
-                                             pass2_intercept=True):
+                                             pass2_intercept=True, return_train_fitted=False):
         """
         Predict latent factors via the Three-Pass Regression Filter (Kelly & Pruitt 2015).
 
         Each IPCA factor k is used as a scalar proxy z_k.  Three passes are run
         independently per k and fully vectorised across k using matrix operations:
 
-            Pass 1 — loading vector:
-                b_k = X_s_train' z_k / (z_k' z_k)               (P,)
-                where X_s_train is the standardised macro panel (T_train x P).
+            Pass 1 — loading vector (with intercept, via FWL):
+                b_k = X_s_train' z_c_k / (z_c_k' z_c_k)        (P,)
+                where X_s_train is the standardised macro panel (T_train x P)
+                and z_c_k is the centred proxy (z_k - mean(z_k)).
 
             Pass 2 — filtered factor:
                 Without intercept: f̂_k(t) = x_s(t)' b_k / (b_k' b_k)
@@ -1671,11 +1747,12 @@ class ipca(object):
         Predictors are standardised using training-window mean and std.
         The target (Factor) is NOT centred.
 
-        Factor          : (KM, T_train) ndarray of factor realisations
-        MacroData_train : df(T_train x P)
-        MacroData_test  : df(T_test x P) or Series(P,)
-        pass2_intercept : bool — include cross-sectional intercept in Pass 2
-        Returns         : (KM, T_test) ndarray or (KM,) if MacroData_test is a Series
+        Factor              : (KM, T_train) ndarray of factor realisations
+        MacroData_train     : df(T_train x P)
+        MacroData_test      : df(T_test x P) or Series(P,)
+        pass2_intercept     : bool — include cross-sectional intercept in Pass 2
+        return_train_fitted : bool — when True return (test_pred, train_fitted) tuple.
+        Returns             : (KM, T_test) ndarray or (KM,) if MacroData_test is a Series
         """
         KM = Factor.shape[0]
 
@@ -1695,9 +1772,13 @@ class ipca(object):
         X_test_s  = (X_test_raw - mean_x) / std_x                # (T_test x P)
 
         # --- Pass 1: loading matrix B (P x KM) ---
+        # Centre the proxy so that Pass 1 estimates the slope from the
+        # intercept regression  x_s = a + c*z  (FWL: regress on centred z).
+        # X_s is already zero-mean over the training window.
         Z     = Factor.T                                           # (T_train x KM)
-        z_sq  = (Z ** 2).sum(axis=0)                              # (KM,)  z_k'z_k
-        B     = X_s.T @ Z / z_sq                                  # (P x KM)
+        Z_c   = Z - Z.mean(axis=0)                                # centred proxy
+        z_c_sq = (Z_c ** 2).sum(axis=0)                           # (KM,)
+        B     = X_s.T @ Z_c / z_c_sq                              # (P x KM)
 
         # --- Pass 2: filtered factors (T x KM) for both train and test ---
         b_sq  = (B ** 2).sum(axis=0)                              # (KM,)
@@ -1735,20 +1816,28 @@ class ipca(object):
         pred = intercepts + slopes * F_hat_test                   # (T_test x KM)
 
         if is_series:
-            return pred[0]                                        # (KM,)
-        return pred.T                                             # (KM x T_test)
+            test_pred = pred[0]                                   # (KM,)
+        else:
+            test_pred = pred.T                                    # (KM x T_test)
+
+        if return_train_fitted:
+            train_fitted = (intercepts + slopes * F_hat_train).T  # (KM, T_train)
+            return test_pred, train_fitted
+        return test_pred
 
     def _dispatch_macro_predict(self, Factor, MacroData_train, MacroData_test,
                                 regularization, target_variance, alpha,
-                                pass2_intercept=True):
+                                pass2_intercept=True, return_train_fitted=False):
         """
         Dispatch macro-to-factor prediction to the appropriate forecombo helper.
 
-        Factor          : (KM, T_train) ndarray
-        MacroData_train : df(T_train x P)  — caller supplies the correct training slice
-        MacroData_test  : df(T_test x P) or Series(P,) — caller supplies the correct test slice
-        pass2_intercept : bool — passed through to 3PRF only (ignored otherwise)
-        Returns         : (KM, T_test) if MacroData_test is DataFrame, (KM,) if Series
+        Factor              : (KM, T_train) ndarray
+        MacroData_train     : df(T_train x P)  — caller supplies the correct training slice
+        MacroData_test      : df(T_test x P) or Series(P,) — caller supplies the correct test slice
+        pass2_intercept     : bool — passed through to 3PRF only (ignored otherwise)
+        return_train_fitted : bool — when True return (test_pred, train_fitted) tuple where
+                              train_fitted is (KM, T_train); otherwise return test_pred only.
+        Returns             : (KM, T_test) if MacroData_test is DataFrame, (KM,) if Series
         """
         if regularization == '3prf':
             if target_variance is not None:
@@ -1756,29 +1845,37 @@ class ipca(object):
                 train_red = self._pca_transform(MacroData_train, Vt_n, pca_mean, pca_std)
                 test_red  = self._pca_transform(MacroData_test,  Vt_n, pca_mean, pca_std)
                 return self._predict_factors_with_forecombo_3prf(
-                    Factor, train_red, test_red, pass2_intercept)
+                    Factor, train_red, test_red, pass2_intercept,
+                    return_train_fitted=return_train_fitted)
             else:
                 return self._predict_factors_with_forecombo_3prf(
-                    Factor, MacroData_train, MacroData_test, pass2_intercept)
+                    Factor, MacroData_train, MacroData_test, pass2_intercept,
+                    return_train_fitted=return_train_fitted)
         elif target_variance is not None:
             if regularization == 'ridge':
                 return self._predict_factors_with_forecombo_pca_ridge(
-                    Factor, MacroData_train, MacroData_test, target_variance, alpha)
+                    Factor, MacroData_train, MacroData_test, target_variance, alpha,
+                    return_train_fitted=return_train_fitted)
             elif regularization == 'lasso':
                 return self._predict_factors_with_forecombo_pca_lasso(
-                    Factor, MacroData_train, MacroData_test, target_variance, alpha)
+                    Factor, MacroData_train, MacroData_test, target_variance, alpha,
+                    return_train_fitted=return_train_fitted)
             else:
                 return self._predict_factors_with_forecombo_pca(
-                    Factor, MacroData_train, MacroData_test, target_variance)
+                    Factor, MacroData_train, MacroData_test, target_variance,
+                    return_train_fitted=return_train_fitted)
         elif regularization == 'ridge':
             return self._predict_factors_with_forecombo_ridge(
-                Factor, MacroData_train, MacroData_test, alpha)
+                Factor, MacroData_train, MacroData_test, alpha,
+                return_train_fitted=return_train_fitted)
         elif regularization == 'lasso':
             return self._predict_factors_with_forecombo_lasso(
-                Factor, MacroData_train, MacroData_test, alpha)
+                Factor, MacroData_train, MacroData_test, alpha,
+                return_train_fitted=return_train_fitted)
         else:
             return self._predict_factors_with_forecombo_uncon(
-                Factor, MacroData_train, MacroData_test)
+                Factor, MacroData_train, MacroData_test,
+                return_train_fitted=return_train_fitted)
 
     # ------------------------------------------------------------------
     # Combining predictions (forecombo mode)
