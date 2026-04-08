@@ -33,10 +33,9 @@ level 0 is `Date` and level 1 is `AssetID`. The first column (or whichever
 column is indicated by `return_column`) is the return; all remaining columns
 are characteristics.
 
-**Timing convention.** Rows are indexed by the date the return is *realized*.
-Characteristics should already be lagged before passing to `ipca` so that
-`Z` at date `d` reflects information available at `d-1`. The code does not
-apply any internal lag.
+**Timing convention.** 
+Characteristics should already be lagged before passing to `ipca`, relative to when the return was realized. The code does not
+apply any internal lag. Note this for macro data passed to `ipca.fit` below.
 
 ```python
 # RZ has shape (TotalObs, 1 + L0) with a (Date, AssetID) MultiIndex.
@@ -157,6 +156,8 @@ results = model.fit(K=3, factor_mean='macro', MacroData=md,
 ```
 
 `LambdaM` holds the macro predictions; for `'macro'` it equals `Lambda['estimate']`.
+
+**Timing convention.** The macro data should be timed to be lagged relative to the return (likely contemporaneous with characteristics). Example: suppose RZ is given such that row `Date` d denotes when the characteristics are realized; the return in that row d was actually realized at date d+1. Then pass macro data with `Date` d meaning when the macro variable was realized.
 
 ### `'forecombo'`
 
