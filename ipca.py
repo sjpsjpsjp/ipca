@@ -378,6 +378,13 @@ class ipca(object):
         # LambdaM is populated only for factor_mean='macro' or 'forecombo'; None otherwise
         LambdaM = None
 
+        # Sentinels — assigned inside IS or OOS branch; declared here so
+        # static analysis sees them as always bound before the return dict.
+        fittedX = fittedR = fittedBeta = None
+        Gamma = Factor = TanPtf = ArbPtf = None
+        lasso_selected = None
+        numerical_stats: dict = {}
+
         # ------------------------------------------------------------------
         # In-sample estimation
         # ------------------------------------------------------------------
@@ -440,16 +447,22 @@ class ipca(object):
             lamt_const = np.zeros(KM)       # overwritten when factor_mean == 'constant'
             LambdaV    = np.zeros((KM, T))  # overwritten for VAR1 / macro / forecombo
 
+            # lasso_selected: populated for regularization='lasso' (IS); None otherwise.
+            lasso_selected = None
+
             # For macro IS: single batch call — fit on all T, evaluate at all T
             if factor_mean == 'macro':
-                LambdaM_arr = self._dispatch_macro_predict(
+                LambdaM_arr, _, _is_sel = self._dispatch_macro_predict(
                     FV,
                     MacroData.iloc[:T],   # training rows
                     MacroData.iloc[:T],   # test rows = same T dates (IS)
                     regularization, target_variance, alpha,
-                    pass2_intercept)      # (KM, T)
+                    pass2_intercept,
+                    return_selected=True)  # always returns 3-tuple when return_selected=True
                 Lambda  = pd.DataFrame(LambdaM_arr, index=Factor_names, columns=self.Dates)
                 LambdaM = Lambda.copy()
+                if _is_sel is not None:
+                    lasso_selected = _is_sel  # (selected_mask, predictor_names) for IS
 
             # For forecombo IS: fill VAR1 forecasts (per-t), batch macro forecasts, then combine
             elif factor_mean == 'forecombo':
@@ -460,13 +473,16 @@ class ipca(object):
 
                 # (b) Macro forecasts — single regression fit, all T evaluations
                 #     MacroData_train and MacroData_test are the same T rows for IS
-                LambdaM_arr = self._dispatch_macro_predict(
+                LambdaM_arr, _, _is_sel = self._dispatch_macro_predict(
                     FV,
                     MacroData.iloc[:T],   # training rows
                     MacroData.iloc[:T],   # test rows = same (IS: predict in-sample)
                     regularization, target_variance, alpha,
-                    pass2_intercept)      # (KM, T)
+                    pass2_intercept,
+                    return_selected=True)
                 LambdaM = pd.DataFrame(LambdaM_arr, index=Factor_names, columns=self.Dates)
+                if _is_sel is not None:
+                    lasso_selected = _is_sel  # (selected_mask, predictor_names) for IS
 
                 # (c) Combine VAR1 and macro (overwrites Lambda cols 1..T-1)
                 #     _calculate_combined_predictions returns (KM, T-1)
@@ -929,6 +945,26 @@ class ipca(object):
                           % (t, numerical_stats['iters'][t].values[0],
                              numerical_stats['time'][t].values[0]))
 
+            # Build lasso_selected DataFrame from per-period accumulation.
+            # Shape: (KM, T_oos) with columns=OOS_dates, index=Factor_names.
+            # Each column is the selected_mask (P, KM) bool array for that period,
+            # stored as a MultiIndex DataFrame: index=(Predictor, Factor), columns=Dates.
+            if lasso_sel_list:
+                sel_dates  = [item[0] for item in lasso_sel_list]
+                sel_masks  = [item[1][0] for item in lasso_sel_list]   # list of (P, KM) bool
+                pnames     = lasso_sel_list[0][1][1]                   # predictor names (P,)
+                # Stack into (n_oos, P, KM) then reshape to MultiIndex DataFrame
+                mask_arr = np.stack(sel_masks, axis=0)                 # (n_oos, P, KM)
+                midx = pd.MultiIndex.from_product([pnames, Factor_names],
+                                                  names=['Predictor', 'Factor'])
+                # Reshape to (P*KM, n_oos) for DataFrame construction
+                lasso_selected = pd.DataFrame(
+                    mask_arr.reshape(len(sel_dates), -1).T,            # (P*KM, n_oos)
+                    index=midx,
+                    columns=sel_dates)
+            else:
+                lasso_selected = None
+
             # OOS R2s (computed only over OOS periods)
             oos_slice = self.Dates[OOS_window_specs:]
             fittedX['R2_Total'], fittedX['R2_Pred'] = self._R2_calc(
@@ -956,16 +992,17 @@ class ipca(object):
         fitend = datetime.now()
         numerical_stats['fit_start_time'] = fitstart
         numerical_stats['fit_end_time'] = fitend
-        return {'xfits':       fittedX,
-                'Gamma':       Gamma,
-                'Factor':      Factor,
-                'Lambda':      Lambda_dict,
-                'LambdaM':     LambdaM,
-                'TanPtf':      TanPtf,
-                'ArbPtf':      ArbPtf,
-                'rfits':       fittedR,
-                'fittedBeta':  fittedBeta,
-                'numerical':   numerical_stats}
+        return {'xfits':          fittedX,
+                'Gamma':          Gamma,
+                'Factor':         Factor,
+                'Lambda':         Lambda_dict,
+                'LambdaM':        LambdaM,
+                'TanPtf':         TanPtf,
+                'ArbPtf':         ArbPtf,
+                'rfits':          fittedR,
+                'fittedBeta':     fittedBeta,
+                'lasso_selected': lasso_selected,
+                'numerical':      numerical_stats}
 
     # ------------------------------------------------------------------
     # Linear-system helpers
