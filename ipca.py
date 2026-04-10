@@ -11,12 +11,14 @@ import copy
 import warnings
 from datetime import datetime
 from timeit import default_timer as timer
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import scipy.linalg as sla
 from sklearn.linear_model import lasso_path
 from sklearn.exceptions import ConvergenceWarning
+from joblib import Parallel, delayed
 
 
 
@@ -92,15 +94,24 @@ class ipca(object):
                     columns=charlist)
             self.Nts = pd.Series(index=datelist, data=np.nan)
 
-            for t in datelist:
+            def _xw_for_date(t):
                 Zt = self.Z.loc[t, :].values
                 if add_constant:
                     Zt = np.concatenate((Zt, np.ones((Zt.shape[0], 1))), axis=1)
-                self.Nts[t] = Zt.shape[0]
+                Nt = Zt.shape[0]
+                Xt = Zt.T.dot(self.R.loc[t]) / Nt if not self.has_X else None
+                Wt = Zt.T.dot(Zt) / Nt         if not self.has_W else None
+                return Nt, Xt, Wt
+
+            per_date = Parallel(n_jobs=-1, prefer='threads')(
+                delayed(_xw_for_date)(t) for t in datelist)
+
+            for t, (Nt, Xt, Wt) in zip(datelist, per_date):
+                self.Nts[t] = Nt
                 if not self.has_X:
-                    self.X[t] = Zt.T.dot(self.R.loc[t]) / self.Nts[t]
+                    self.X[t] = Xt
                 if not self.has_W:
-                    self.W.loc[t] = Zt.T.dot(Zt) / self.Nts[t]
+                    self.W.loc[t] = Wt
 
         self.Chars = self.X.index
         self.Dates = self.X.columns
@@ -424,6 +435,10 @@ class ipca(object):
             Factor = pd.DataFrame(data=Factor_arr, index=Factor_names, columns=self.Dates)
             FV = Factor_arr  # (KM, T) ndarray alias
             T = len(self.Dates)
+            # Sentinels — overwritten by their respective factor_mean branches below;
+            # declared here so static analysis sees them as always bound.
+            lamt_const = np.zeros(KM)       # overwritten when factor_mean == 'constant'
+            LambdaV    = np.zeros((KM, T))  # overwritten for VAR1 / macro / forecombo
 
             # For macro IS: single batch call — fit on all T, evaluate at all T
             if factor_mean == 'macro':
@@ -486,17 +501,26 @@ class ipca(object):
             fittedX['Fits_Pred'] = pd.DataFrame(fits_pred_arr,
                                                 index=self.Chars, columns=self.Dates)
 
-            # --- R fits (loop required due to ragged MultiIndex) ---
+            # --- R fits (parallelised across dates; iterations are independent) ---
             if Rdo or Betado:
-                for ti, t in enumerate(self.Dates):
-                    Betat = self._compute_beta(t, Gamma_arr)  # (N_t, KM)
-                    if factor_mean == 'constant':
-                        lamt_t = lamt_const
-                    else:
-                        lamt_t = LambdaV[:, ti]
+                # Resolve to a single (KM, T) array so the nested function closes
+                # over one always-bound name (both sentinels initialised above).
+                _lam_arr = (np.tile(lamt_const[:, None], T)
+                            if factor_mean == 'constant' else LambdaV)  # (KM, T)
+
+                def _r_fits_for_date(ti, t):
+                    Betat  = self._compute_beta(t, Gamma_arr)          # (N_t, KM)
+                    ft     = Betat.dot(FV[:, ti]).reshape(-1, 1) if Rdo else None
+                    fp     = Betat.dot(_lam_arr[:, ti]).reshape(-1, 1) if Rdo else None
+                    return Betat, ft, fp
+
+                per_t = Parallel(n_jobs=-1, prefer='threads')(
+                    delayed(_r_fits_for_date)(ti, t) for ti, t in enumerate(self.Dates))
+
+                for (ti, t), (Betat, ft, fp) in zip(enumerate(self.Dates), per_t):
                     if Rdo:
-                        fittedR['Fits_Total'].loc[t] = Betat.dot(FV[:, ti]).reshape(-1, 1)
-                        fittedR['Fits_Pred'].loc[t] = Betat.dot(lamt_t).reshape(-1, 1)
+                        fittedR['Fits_Total'].loc[t] = ft
+                        fittedR['Fits_Pred'].loc[t]  = fp
                         if Betado:
                             fittedBeta.loc[t] = Betat
                     elif Betado:
@@ -684,6 +708,7 @@ class ipca(object):
             ArbPtf = pd.Series(np.nan, index=self.Dates) if has_const else None
 
             # Initialise output storage for macro and forecombo OOS modes
+            lasso_sel_list = []   # list of (t, selected_info) tuples for lasso selection tracking
             if factor_mean == 'macro':
                 LambdaM = pd.DataFrame(data=np.nan, index=Factor_names, columns=self.Dates)
             elif factor_mean == 'forecombo':
@@ -793,12 +818,15 @@ class ipca(object):
                         macro_train = MacroData.iloc[t_idx - OOS_window_specs : t_idx]
                     else:  # recursive
                         macro_train = MacroData.iloc[:t_idx]
-                    lamt_mac, mac_train_fitted = self._dispatch_macro_predict(
+                    lamt_mac, mac_train_fitted, _sel = self._dispatch_macro_predict(
                         Factor0, macro_train, MacroData.loc[t],
                         regularization, target_variance, alpha,
                         pass2_intercept,
-                        return_train_fitted=True)  # (KM,) and (KM, T_train)
+                        return_train_fitted=True,
+                        return_selected=True)  # (KM,), (KM, T_train), selected_info|None
                     LambdaM[t] = lamt_mac
+                    if _sel is not None:
+                        lasso_sel_list.append((t, _sel))
 
                     # (c) OLS combination — expanding window over past OOS history
                     n_hist = len(oos_fac_hist)
@@ -1629,7 +1657,7 @@ class ipca(object):
         return test_pred
 
     def _predict_factors_with_forecombo_lasso(self, Factor, MacroData_train, MacroData_test, alpha,
-                                              return_train_fitted=False):
+                                              return_train_fitted=False, return_selected=False):
         """
         Predict latent factors via LASSO regression on standardised macro data.
 
@@ -1645,8 +1673,17 @@ class ipca(object):
                               non-zero coefficients is used; if the path never
                               reaches alpha active predictors the densest solution
                               is used instead.
-        return_train_fitted : bool — when True return (test_pred, train_fitted) tuple.
-        Returns             : (KM, T_test) or (KM,)
+        return_train_fitted : bool — when True include train_fitted (KM, T_train) in return.
+        return_selected     : bool — when True include selected_mask (P, KM) bool ndarray
+                              indicating which predictors have non-zero coefficients for
+                              each factor.  Combine with return_train_fitted freely; see
+                              return-value description below.
+        Returns
+        -------
+        test_pred                                   when both flags False
+        (test_pred, train_fitted)                   when return_train_fitted only
+        (test_pred, selected_mask)                  when return_selected only
+        (test_pred, train_fitted, selected_mask)    when both flags True
         """
         X_train = MacroData_train.values.astype(np.float64)
 
@@ -1659,21 +1696,30 @@ class ipca(object):
         coef_matrix = np.zeros((P, KM))
         intercepts  = np.zeros(KM)
 
-        for k in range(KM):
+        # Parallelise across factors: each lasso_path call is independent and
+        # uses sklearn's LARS implementation (Cython/numpy), which releases the
+        # GIL.  The threading backend therefore achieves true parallelism with
+        # zero pickling overhead.  Meaningful when KM >= 3 and P is large
+        # (wide macro panel); overhead dominates for KM <= 2 or narrow panels.
+        def _lasso_for_k(k):
             y      = Factor[k, :]
-            y_mean = y.mean()
-            y_c    = y - y_mean                           # centre; lasso_path has no fit_intercept
-
+            y_mean = float(y.mean())
+            y_c    = y - y_mean                       # centre; lasso_path has no fit_intercept
             with warnings.catch_warnings():
                 warnings.simplefilter('ignore', ConvergenceWarning)
-                alphas_path, coefs_path, _ = lasso_path(X_train_s, y_c)
+                coefs_path = lasso_path(X_train_s, y_c)[1]
             # alphas_path is decreasing → n_nonzero increases along the path
             n_nonzero = (coefs_path != 0).sum(axis=0)
             valid = np.where(n_nonzero <= int(alpha))[0]
-            idx   = valid[-1] if len(valid) > 0 else len(alphas_path) - 1
+            idx   = valid[-1] if len(valid) > 0 else coefs_path.shape[1] - 1
+            return coefs_path[:, idx], y_mean         # (P,), scalar
 
-            coef_matrix[:, k] = coefs_path[:, idx]
-            intercepts[k]     = y_mean
+        per_k = Parallel(n_jobs=-1, prefer='threads')(
+            delayed(_lasso_for_k)(k) for k in range(KM))
+
+        for k, (coef_k, intercept_k) in enumerate(per_k):
+            coef_matrix[:, k] = coef_k
+            intercepts[k]     = intercept_k
 
         if isinstance(MacroData_test, pd.Series):
             x_t = (MacroData_test.values.astype(np.float64) - mean) / std
@@ -1683,9 +1729,16 @@ class ipca(object):
             X_test_s = (X_test - mean) / std
             test_pred = coef_matrix.T @ X_test_s.T + intercepts[:, None]  # (KM, T_test)
 
+        train_fitted   = (coef_matrix.T @ X_train_s.T + intercepts[:, None]  # (KM, T_train)
+                          if return_train_fitted else None)
+        selected_mask  = (coef_matrix != 0) if return_selected else None      # (P, KM) bool
+
+        if return_train_fitted and return_selected:
+            return test_pred, train_fitted, selected_mask
         if return_train_fitted:
-            train_fitted = coef_matrix.T @ X_train_s.T + intercepts[:, None]  # (KM, T_train)
             return test_pred, train_fitted
+        if return_selected:
+            return test_pred, selected_mask
         return test_pred
 
     def _predict_factors_with_forecombo_pca(self, Factor, MacroData_train, MacroData_test,
@@ -1709,13 +1762,21 @@ class ipca(object):
 
     def _predict_factors_with_forecombo_pca_lasso(self, Factor, MacroData_train, MacroData_test,
                                                   target_variance, alpha,
-                                                  return_train_fitted=False):
-        """PCA pre-processing then LASSO prediction."""
+                                                  return_train_fitted=False,
+                                                  return_selected=False):
+        """PCA pre-processing then LASSO prediction.
+
+        When return_selected=True the selected_mask rows correspond to PCs, not
+        original predictors.  PC labels ('PC_1', 'PC_2', …) are assigned by the
+        caller (_dispatch_macro_predict) which knows n_comp after fitting.
+        """
         Vt_n, pca_mean, pca_std = self._pca_fit(MacroData_train, target_variance)
         train_red = self._pca_transform(MacroData_train, Vt_n, pca_mean, pca_std)
         test_red  = self._pca_transform(MacroData_test,  Vt_n, pca_mean, pca_std)
         return self._predict_factors_with_forecombo_lasso(
-            Factor, train_red, test_red, alpha, return_train_fitted=return_train_fitted)
+            Factor, train_red, test_red, alpha,
+            return_train_fitted=return_train_fitted,
+            return_selected=return_selected)
 
     def _predict_factors_with_forecombo_3prf(self, Factor, MacroData_train, MacroData_test,
                                              pass2_intercept=True, return_train_fitted=False):
@@ -1827,7 +1888,8 @@ class ipca(object):
 
     def _dispatch_macro_predict(self, Factor, MacroData_train, MacroData_test,
                                 regularization, target_variance, alpha,
-                                pass2_intercept=True, return_train_fitted=False):
+                                pass2_intercept=True, return_train_fitted=False,
+                                return_selected=False) -> Any:
         """
         Dispatch macro-to-factor prediction to the appropriate forecombo helper.
 
@@ -1835,47 +1897,96 @@ class ipca(object):
         MacroData_train     : df(T_train x P)  — caller supplies the correct training slice
         MacroData_test      : df(T_test x P) or Series(P,) — caller supplies the correct test slice
         pass2_intercept     : bool — passed through to 3PRF only (ignored otherwise)
-        return_train_fitted : bool — when True return (test_pred, train_fitted) tuple where
-                              train_fitted is (KM, T_train); otherwise return test_pred only.
-        Returns             : (KM, T_test) if MacroData_test is DataFrame, (KM,) if Series
+        return_train_fitted : bool — when True include train_fitted (KM, T_train) in return.
+        return_selected     : bool — when True include selected_info in return.
+                              selected_info is a (selected_mask, predictor_names) tuple for
+                              regularization='lasso' (raw or PCA), or None for other methods.
+                              For raw lasso, predictor_names = MacroData_train.columns.
+                              For PCA+lasso, predictor_names = ['PC_1', 'PC_2', ...] (PC-space
+                              selection; PC_k corresponds to the k-th retained component).
+
+        Returns (depending on flags)
+        ----------------------------
+        test_pred                                      both flags False
+        (test_pred, train_fitted)                      return_train_fitted only
+        (test_pred, selected_info)                     return_selected only
+        (test_pred, train_fitted, selected_info)       both flags True
         """
+        is_lasso = (regularization == 'lasso')
+
+        # --- dispatch to the appropriate helper ---
         if regularization == '3prf':
             if target_variance is not None:
                 Vt_n, pca_mean, pca_std = self._pca_fit(MacroData_train, target_variance)
                 train_red = self._pca_transform(MacroData_train, Vt_n, pca_mean, pca_std)
                 test_red  = self._pca_transform(MacroData_test,  Vt_n, pca_mean, pca_std)
-                return self._predict_factors_with_forecombo_3prf(
+                result = self._predict_factors_with_forecombo_3prf(
                     Factor, train_red, test_red, pass2_intercept,
                     return_train_fitted=return_train_fitted)
             else:
-                return self._predict_factors_with_forecombo_3prf(
+                result = self._predict_factors_with_forecombo_3prf(
                     Factor, MacroData_train, MacroData_test, pass2_intercept,
                     return_train_fitted=return_train_fitted)
         elif target_variance is not None:
             if regularization == 'ridge':
-                return self._predict_factors_with_forecombo_pca_ridge(
+                result = self._predict_factors_with_forecombo_pca_ridge(
                     Factor, MacroData_train, MacroData_test, target_variance, alpha,
                     return_train_fitted=return_train_fitted)
-            elif regularization == 'lasso':
-                return self._predict_factors_with_forecombo_pca_lasso(
+            elif is_lasso:
+                result = self._predict_factors_with_forecombo_pca_lasso(
                     Factor, MacroData_train, MacroData_test, target_variance, alpha,
-                    return_train_fitted=return_train_fitted)
+                    return_train_fitted=return_train_fitted,
+                    return_selected=return_selected)
             else:
-                return self._predict_factors_with_forecombo_pca(
+                result = self._predict_factors_with_forecombo_pca(
                     Factor, MacroData_train, MacroData_test, target_variance,
                     return_train_fitted=return_train_fitted)
-        elif regularization == 'ridge':
-            return self._predict_factors_with_forecombo_ridge(
+        elif is_lasso:
+            result = self._predict_factors_with_forecombo_lasso(
                 Factor, MacroData_train, MacroData_test, alpha,
-                return_train_fitted=return_train_fitted)
-        elif regularization == 'lasso':
-            return self._predict_factors_with_forecombo_lasso(
+                return_train_fitted=return_train_fitted,
+                return_selected=return_selected)
+        elif regularization == 'ridge':
+            result = self._predict_factors_with_forecombo_ridge(
                 Factor, MacroData_train, MacroData_test, alpha,
                 return_train_fitted=return_train_fitted)
         else:
-            return self._predict_factors_with_forecombo_uncon(
+            result = self._predict_factors_with_forecombo_uncon(
                 Factor, MacroData_train, MacroData_test,
                 return_train_fitted=return_train_fitted)
+
+        # --- handle return_selected ---
+        if not return_selected:
+            return result
+
+        # When return_selected=True we always return a consistent 3-tuple:
+        #   (test_pred, train_fitted, selected_info)
+        # train_fitted is None when return_train_fitted=False.
+        # selected_info is (selected_mask, predictor_names) for lasso, else None.
+        train_fitted  = None
+        selected_info = None
+
+        if is_lasso:
+            # Lasso helpers include selected_mask as the last element.
+            if return_train_fitted:
+                test_pred, train_fitted, selected_mask = result
+            else:
+                test_pred, selected_mask = result
+            # Predictor names: PC labels when PCA was applied, else raw macro names.
+            if target_variance is not None:
+                n_comp = selected_mask.shape[0]
+                pnames = [f'PC_{i + 1}' for i in range(n_comp)]
+            else:
+                pnames = list(MacroData_train.columns)
+            selected_info = (selected_mask, pnames)
+        else:
+            # Non-lasso paths: unpack test_pred (and train_fitted if requested).
+            if return_train_fitted:
+                test_pred, train_fitted = result
+            else:
+                test_pred = result
+
+        return test_pred, train_fitted, selected_info
 
     # ------------------------------------------------------------------
     # Combining predictions (forecombo mode)
