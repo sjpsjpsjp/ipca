@@ -140,6 +140,7 @@ class ipca(object):
             dispIters=False, minTol=1e-4, maxIters=5000,
             F_names=None, G_names=None, R2_bench='zero', dispItersInt=100,
             MacroData=None, target_variance=None, regularization=None, alpha=None,
+            ridge_df=5,
             pass2_intercept=True,
             min_combo_periods=None, min_train_periods=None,
             kappa_max=1e8, const_tol=1e-6, tan_target_vol=1.0):
@@ -245,12 +246,21 @@ class ipca(object):
             PCA pre-processing before the regression.
 
         alpha : float or int or None :
-            ridge  — regularisation penalty strength (positive float).
+            ridge  — regularisation penalty strength (positive float). Ignored when
+                     ridge_df is not None (ridge_df takes precedence).
             lasso  — target number of active macro predictors (positive int).
                      The full LASSO regularisation path is computed and the
                      least-penalised solution with at most alpha non-zero
                      coefficients is selected independently for each factor.
             3prf   — unused; pass2_intercept controls Pass 2 behaviour.
+
+        ridge_df : float or None : target effective degrees of freedom for ridge regression.
+            Applies when regularization='ridge' (with or without PCA pre-processing).
+            Effective df is defined as  df(λ) = Σ σ_i² / (σ_i² + λ)  where σ_i are the
+            singular values of the (standardised) macro panel.  df ranges from P (λ=0, OLS)
+            down to 0 (full shrinkage).  ridge_df=5 (default) targets the equivalent of
+            roughly 5 active directions.  When ridge_df is not None it overrides alpha for
+            ridge; when ridge_df=None alpha is used directly as the penalty λ.
 
         pass2_intercept : bool : (default True) applies only when regularization='3prf'.
             True  — include a cross-sectional intercept in Pass 2, as in Kelly &
@@ -458,7 +468,8 @@ class ipca(object):
                     MacroData.iloc[:T],   # test rows = same T dates (IS)
                     regularization, target_variance, alpha,
                     pass2_intercept,
-                    return_selected=True)  # always returns 3-tuple when return_selected=True
+                    return_selected=True,
+                    ridge_df=ridge_df)  # always returns 3-tuple when return_selected=True
                 Lambda  = pd.DataFrame(LambdaM_arr, index=Factor_names, columns=self.Dates)
                 LambdaM = Lambda.copy()
                 if _is_sel is not None:
@@ -479,7 +490,8 @@ class ipca(object):
                     MacroData.iloc[:T],   # test rows = same (IS: predict in-sample)
                     regularization, target_variance, alpha,
                     pass2_intercept,
-                    return_selected=True)
+                    return_selected=True,
+                    ridge_df=ridge_df)
                 LambdaM = pd.DataFrame(LambdaM_arr, index=Factor_names, columns=self.Dates)
                 if _is_sel is not None:
                     lasso_selected = _is_sel  # (selected_mask, predictor_names) for IS
@@ -839,7 +851,8 @@ class ipca(object):
                         regularization, target_variance, alpha,
                         pass2_intercept,
                         return_train_fitted=True,
-                        return_selected=True)  # (KM,), (KM, T_train), selected_info|None
+                        return_selected=True,
+                        ridge_df=ridge_df)  # (KM,), (KM, T_train), selected_info|None
                     LambdaM[t] = lamt_mac
                     if _sel is not None:
                         lasso_sel_list.append((t, _sel))
@@ -886,11 +899,15 @@ class ipca(object):
                         macro_train = MacroData.iloc[t_idx - OOS_window_specs : t_idx]
                     else:  # recursive
                         macro_train = MacroData.iloc[:t_idx]
-                    lamt, mac_train_fitted = self._dispatch_macro_predict(
+                    lamt, mac_train_fitted, _sel = self._dispatch_macro_predict(
                         Factor0, macro_train, MacroData.loc[t],
                         regularization, target_variance, alpha,
                         pass2_intercept,
-                        return_train_fitted=True)  # (KM,) and (KM, T_train)
+                        return_train_fitted=True,
+                        return_selected=True,
+                        ridge_df=ridge_df)  # (KM,), (KM, T_train), selected_info|None
+                    if _sel is not None:
+                        lasso_sel_list.append((t, _sel))
                     Lambda[t]  = lamt
                     LambdaM[t] = lamt
                     # B stays None — no VAR component
@@ -1655,14 +1672,15 @@ class ipca(object):
         return test_pred
 
     def _predict_factors_with_forecombo_ridge(self, Factor, MacroData_train, MacroData_test, alpha,
-                                              return_train_fitted=False):
+                                              return_train_fitted=False, ridge_df=None):
         """
         Predict latent factors via Ridge regression on standardised macro data.
 
         Factor              : (KM, T_train) ndarray
         MacroData_train     : df(T_train x P)
         MacroData_test      : df(T_test x P) or Series(P,)
-        alpha               : Ridge penalty strength
+        alpha               : Ridge penalty strength. Ignored when ridge_df is not None.
+        ridge_df            : target effective degrees of freedom; when provided, overrides alpha.
         return_train_fitted : bool — when True return (test_pred, train_fitted) tuple.
         Returns             : (KM, T_test) or (KM,)
         """
@@ -1671,6 +1689,9 @@ class ipca(object):
         mean = X_train.mean(axis=0)
         std  = np.where(X_train.std(axis=0) > 1e-12, X_train.std(axis=0), 1.0)
         X_train_s = (X_train - mean) / std
+
+        if ridge_df is not None:
+            alpha = self._ridge_lambda_from_df(X_train_s, ridge_df)
 
         KM   = Factor.shape[0]
         beta = np.zeros((X_train_s.shape[1] + 1, KM))
@@ -1789,13 +1810,14 @@ class ipca(object):
 
     def _predict_factors_with_forecombo_pca_ridge(self, Factor, MacroData_train, MacroData_test,
                                                   target_variance, alpha,
-                                                  return_train_fitted=False):
+                                                  return_train_fitted=False, ridge_df=None):
         """PCA pre-processing then Ridge prediction."""
         Vt_n, pca_mean, pca_std = self._pca_fit(MacroData_train, target_variance)
         train_red = self._pca_transform(MacroData_train, Vt_n, pca_mean, pca_std)
         test_red  = self._pca_transform(MacroData_test,  Vt_n, pca_mean, pca_std)
         return self._predict_factors_with_forecombo_ridge(
-            Factor, train_red, test_red, alpha, return_train_fitted=return_train_fitted)
+            Factor, train_red, test_red, alpha,
+            return_train_fitted=return_train_fitted, ridge_df=ridge_df)
 
     def _predict_factors_with_forecombo_pca_lasso(self, Factor, MacroData_train, MacroData_test,
                                                   target_variance, alpha,
@@ -1926,7 +1948,7 @@ class ipca(object):
     def _dispatch_macro_predict(self, Factor, MacroData_train, MacroData_test,
                                 regularization, target_variance, alpha,
                                 pass2_intercept=True, return_train_fitted=False,
-                                return_selected=False) -> Any:
+                                return_selected=False, ridge_df=None) -> Any:
         """
         Dispatch macro-to-factor prediction to the appropriate forecombo helper.
 
@@ -1968,7 +1990,7 @@ class ipca(object):
             if regularization == 'ridge':
                 result = self._predict_factors_with_forecombo_pca_ridge(
                     Factor, MacroData_train, MacroData_test, target_variance, alpha,
-                    return_train_fitted=return_train_fitted)
+                    return_train_fitted=return_train_fitted, ridge_df=ridge_df)
             elif is_lasso:
                 result = self._predict_factors_with_forecombo_pca_lasso(
                     Factor, MacroData_train, MacroData_test, target_variance, alpha,
@@ -1986,7 +2008,7 @@ class ipca(object):
         elif regularization == 'ridge':
             result = self._predict_factors_with_forecombo_ridge(
                 Factor, MacroData_train, MacroData_test, alpha,
-                return_train_fitted=return_train_fitted)
+                return_train_fitted=return_train_fitted, ridge_df=ridge_df)
         else:
             result = self._predict_factors_with_forecombo_uncon(
                 Factor, MacroData_train, MacroData_test,
@@ -2203,6 +2225,49 @@ class ipca(object):
     # ------------------------------------------------------------------
     # Ridge helper
     # ------------------------------------------------------------------
+
+    def _ridge_lambda_from_df(self, X_s, target_df):
+        """
+        Find the ridge penalty λ such that the effective degrees of freedom equals target_df.
+
+        Effective df: df(λ) = Σ_i σ_i² / (σ_i² + λ)
+        where σ_i are the singular values of X_s (standardised design matrix, no intercept).
+        df is monotone decreasing in λ, ranging from P (λ=0) to 0 (λ→∞).
+        Solved via bisection (Brent's method).
+
+        X_s        : (T, P) standardised design matrix
+        target_df  : desired effective df (float in (0, P])
+        Returns    : λ (float)
+        """
+        sv = np.linalg.svd(X_s, compute_uv=False)   # (min(T,P),) singular values
+        sv2 = sv ** 2
+
+        def eff_df(lam):
+            return float(np.sum(sv2 / (sv2 + lam)))
+
+        df_max = eff_df(0.0)   # ≈ min(T, P); may be < P if T < P
+
+        # Clamp target so it's achievable
+        target = float(np.clip(target_df, 1e-6, df_max))
+        if target >= df_max - 1e-10:
+            return 0.0  # no penalty needed
+
+        # Bracket: find upper bound where df < target
+        lam_hi = 1.0
+        while eff_df(lam_hi) > target:
+            lam_hi *= 10.0
+
+        # Bisection (df is strictly monotone decreasing, so simple bisect suffices)
+        lam_lo = 0.0
+        for _ in range(60):  # 60 iterations → error < 2^{-60} * lam_hi
+            lam_mid = 0.5 * (lam_lo + lam_hi)
+            if eff_df(lam_mid) > target:
+                lam_lo = lam_mid
+            else:
+                lam_hi = lam_mid
+            if lam_hi - lam_lo < 1e-10 * (1.0 + lam_hi):
+                break
+        return 0.5 * (lam_lo + lam_hi)
 
     def _ridge_regression(self, X, y, lambda_):
         """
