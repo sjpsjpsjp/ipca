@@ -2,7 +2,7 @@
 IPCA: Instrumented Principal Components Analysis
 Estimation class for Kelly, Pruitt, and Su (2019 JFE)
 
-version 2.0.1
+version 2.0.2
 
 copyright Seth Pruitt (2020-2026)
 """
@@ -143,7 +143,8 @@ class ipca(object):
             ridge_df=5,
             pass2_intercept=True,
             min_combo_periods=None, min_train_periods=None,
-            kappa_max=1e8, const_tol=1e-6, tan_target_vol=1.0):
+            kappa_max=1e8, const_tol=1e-6, tan_target_vol=1.0,
+            oos_n_jobs=1, oos_chunk_size=None):
         """
         [Inputs]
 
@@ -289,6 +290,21 @@ class ipca(object):
 
         tan_target_vol : float : target portfolio volatility for TanPtf weight scaling. Default 1.0
             (unit-volatility tangency portfolio).
+
+        oos_n_jobs : int : number of parallel workers for the OOS ALS loop. Default 1 (serial).
+            Follows joblib convention: 1 = serial, -1 = all available cores, n = exactly n workers.
+            For SLURM jobs, set to the value of $SLURM_CPUS_PER_TASK.
+            Uses the threading backend (no data copying; safe because ALS reads self._W / self._X
+            without modifying them).
+
+        oos_chunk_size : int or None : number of OOS periods per parallel batch. Default None,
+            which resolves to oos_n_jobs (or the detected core count when oos_n_jobs=-1).
+            All periods within a chunk share the same Gamma warm-start (the converged Gamma from
+            the end of the previous chunk). Larger chunks reduce warm-start refresh overhead
+            at the cost of a staler initializer for later periods in the chunk. For forecombo,
+            the combination-weight history seen by each period in a chunk is frozen at the
+            chunk boundary — an approximation whose error is bounded by chunk_size periods.
+            Ignored when oos_n_jobs=1.
 
         [Outputs] dict with the following keys
 
@@ -737,6 +753,10 @@ class ipca(object):
 
             # Initialise output storage for macro and forecombo OOS modes
             lasso_sel_list = []   # list of (t, selected_info) tuples for lasso selection tracking
+            # Sentinels for forecombo histories — overwritten below when factor_mean='forecombo'
+            oos_var_hist: list = []
+            oos_mac_hist: list = []
+            oos_fac_hist: list = []
             if factor_mean == 'macro':
                 LambdaM = pd.DataFrame(data=np.nan, index=Factor_names, columns=self.Dates)
             elif factor_mean == 'forecombo':
@@ -747,220 +767,216 @@ class ipca(object):
                 _min_combo = (max(3, KM + 2) if min_combo_periods is None
                               else int(min_combo_periods))
 
-            ct = 0
-            OOS_dates = self.Dates[OOS_window_specs:]
-            for t in OOS_dates:
-                t_idx = self.Dates.get_loc(t)  # integer position of t in self.Dates
-                tol, iters = float('inf'), 0
+            # ------------------------------------------------------------------
+            # Resolve parallelism settings
+            # ------------------------------------------------------------------
+            if oos_n_jobs < 0:
+                from joblib import cpu_count as _jl_cpu_count
+                _eff_jobs = _jl_cpu_count()
+            else:
+                _eff_jobs = max(1, oos_n_jobs)
+            _chunk_sz = max(1, oos_chunk_size if oos_chunk_size is not None else _eff_jobs)
 
-                # Date integer indices for the training window (excludes t itself)
-                if OOS_window == 'rolling':
-                    date_ints = np.arange(t_idx - OOS_window_specs, t_idx)
-                else:  # recursive (expanding)
-                    date_ints = np.arange(t_idx)
+            # ------------------------------------------------------------------
+            # Per-period worker — closure over all fit() locals.
+            # Uses the threading backend so self._W / self._X are shared without
+            # copying.  Factor0 is always reset to np.inf here (the sequential
+            # Factor0 extension at the end of the old loop was dead code — it
+            # was immediately overwritten at the start of the next period).
+            # ------------------------------------------------------------------
+            def _one_period(t, Gamma0_in, fc_snap):
+                t_idx_l = self.Dates.get_loc(t)
+                date_ints_l = (np.arange(t_idx_l - OOS_window_specs, t_idx_l)
+                               if OOS_window == 'rolling' else np.arange(t_idx_l))
 
-                # Reset Factor0 to the current window shape before each ALS run.
-                # Factor0 is used only for the convergence check; Gamma0 is the
-                # actual warm start.  Without this reset, the recursive window
-                # grows Factor0 by one column each period, causing a shape
-                # mismatch on the first ALS iteration of every period after the first.
-                Factor0 = np.full((KM, len(date_ints)), np.inf)
+                Gamma0_l  = Gamma0_in.copy()
+                Factor0_l = np.full((KM, len(date_ints_l)), np.inf)
+                tol_l, iters_l = float('inf'), 0
 
-                timerstart = timer()
-                while iters < maxIters and tol > minTol:
-                    iters += 1
+                ts_l = timer()
+                while iters_l < maxIters and tol_l > minTol:
+                    iters_l += 1
                     Gamma1, Factor1 = self._linear_als_estimation(
-                        Gamma0=Gamma0, K=K, M=M, KM=KM,
+                        Gamma0=Gamma0_l, K=K, M=M, KM=KM,
                         normalization_choice=normalization_choice,
                         normalization_choice_specs=normalization_choice_specs,
-                        gFac_arr=gFac_arr, date_ints=date_ints,
+                        gFac_arr=gFac_arr, date_ints=date_ints_l,
                         kappa_max=kappa_max)
-                    tol = max(np.max(np.abs(Gamma1 - Gamma0)), np.max(np.abs(Factor1 - Factor0)))
-                    if dispIters and iters % dispItersInt == 0:
-                        print('iters {}: tol = {:.8f}'.format(iters, tol))
-                    Gamma0, Factor0 = Gamma1, Factor1
+                    tol_l = max(np.max(np.abs(Gamma1 - Gamma0_l)),
+                                np.max(np.abs(Factor1 - Factor0_l)))
+                    Gamma0_l, Factor0_l = Gamma1, Factor1
+                time_l = timer() - ts_l
 
-                numerical_stats['tol'][t] = tol
-                numerical_stats['iters'][t] = iters
-                numerical_stats['time'][t] = timer() - timerstart
-                Gamma.loc[t] = Gamma0
-
-                # OOS factor realization at t:
-                # Use Gamma estimated from training data (through t-1) with W, X at t
-                Wt = self._W[:, :, t_idx]
-                Xt = self._X[:, t_idx]
+                # Factor realization at t
+                Wt_l = self._W[:, :, t_idx_l]
+                Xt_l = self._X[:, t_idx_l]
                 if M == 0:
-                    F_t = self._conditioned_solve(
-                        Gamma0.T @ Wt @ Gamma0,
-                        Gamma0.T @ Xt,
-                        kappa_max=kappa_max)
+                    F_t_l = self._conditioned_solve(
+                        Gamma0_l.T @ Wt_l @ Gamma0_l,
+                        Gamma0_l.T @ Xt_l, kappa_max=kappa_max)
                 else:
-                    GammaF0 = Gamma0[:, :K]
-                    GammaG0 = Gamma0[:, K:]
-                    F_t_lat = self._conditioned_solve(
-                        GammaF0.T @ Wt @ GammaF0,
-                        GammaF0.T @ (Xt - Wt @ GammaG0 @ gFac_arr[:, t_idx]),
-                        kappa_max=kappa_max)
-                    F_t = np.concatenate([F_t_lat, gFac_arr[:, t_idx]])
+                    GammaF_l = Gamma0_l[:, :K]
+                    GammaG_l = Gamma0_l[:, K:]
+                    F_t_l = np.concatenate([
+                        self._conditioned_solve(
+                            GammaF_l.T @ Wt_l @ GammaF_l,
+                            GammaF_l.T @ (Xt_l - Wt_l @ GammaG_l @ gFac_arr[:, t_idx_l]),
+                            kappa_max=kappa_max),
+                        gFac_arr[:, t_idx_l]])
 
-                Factor[t] = F_t
-                fittedX['Fits_Total'][t] = (Wt @ Gamma0 @ F_t).reshape(-1, 1)
+                fits_total_l = (Wt_l @ Gamma0_l @ F_t_l).reshape(-1, 1)
+                ArbPtf_l    = (float(Gamma0_l[:, const_col] @ np.linalg.solve(Wt_l, Xt_l))
+                               if has_const else None)
 
-                # ArbPtf: GammaAlpha' @ W_t^{-1} @ X_t (only when constant gFac detected)
-                if has_const:
-                    ArbPtf[t] = float(
-                        Gamma0[:, const_col] @ np.linalg.solve(Wt, Xt))
-
-                # Factor mean forecast (Lambda at t) — known before t is observed
-                # mu_train_tan: training-window fitted values for K_tan factors,
-                # used to form the residual covariance for TanPtf (None for constant).
-                mu_train_tan = None
+                # Factor mean forecast — sentinel defaults
+                lamt_l          = np.zeros(KM)
+                lamt_mac_l      = None
+                lamt_var_l      = None
+                mu_train_tan_l  = None
+                sel_l           = None
+                B_l             = None
 
                 if factor_mean == 'constant':
-                    lamt = Factor0.mean(axis=1)  # (KM,) training-sample mean
-                    Lambda[t] = lamt
-                    B = np.hstack((np.zeros((KM, KM)), lamt.reshape(-1, 1))).T
-                    # mu_train_tan stays None: raw cov(F) is correct for constant mean
+                    lamt_l = Factor0_l.mean(axis=1)
+                    B_l    = np.hstack((np.zeros((KM, KM)), lamt_l.reshape(-1, 1))).T
 
                 elif factor_mean == 'VAR1':
-                    B = self._VARB(X=Factor0)
-                    lamt = B.T.dot(np.hstack((Factor0[:, -1], 1)).reshape(-1, 1)).ravel()
-                    Lambda[t] = lamt
-                    # VAR1 training fitted: B.T @ [F_{t-1}; 1] for t=1..T_tr-1,
-                    # unconditional mean for t=0. Pure matrix multiply — no re-fitting.
+                    B_l    = self._VARB(X=Factor0_l)
+                    lamt_l = B_l.T.dot(
+                        np.hstack((Factor0_l[:, -1], 1)).reshape(-1, 1)).ravel()
                     if K_tan > 0:
-                        T_tr = Factor0.shape[1]
-                        Ftil = np.vstack([Factor0, np.ones((1, T_tr))])  # (KM+1, T_tr)
-                        _mu_tr = np.empty_like(Factor0)
-                        _mu_tr[:, 0]  = Factor0.mean(axis=1)
-                        _mu_tr[:, 1:] = B.T @ Ftil[:, :-1]              # (KM, T_tr-1)
-                        mu_train_tan  = _mu_tr[:K_tan, :]
+                        T_tr_l  = Factor0_l.shape[1]
+                        Ftil_l  = np.vstack([Factor0_l, np.ones((1, T_tr_l))])
+                        mu_tr_l = np.empty_like(Factor0_l)
+                        mu_tr_l[:, 0]  = Factor0_l.mean(axis=1)
+                        mu_tr_l[:, 1:] = B_l.T @ Ftil_l[:, :-1]
+                        mu_train_tan_l = mu_tr_l[:K_tan, :]
 
                 elif factor_mean == 'forecombo':
-                    # (a) VAR1 forecast using training-window factors
-                    B = self._VARB(X=Factor0)
-                    lamt_var = B.T.dot(np.hstack((Factor0[:, -1], 1)).reshape(-1, 1)).ravel()
-
-                    # (b) Macro forecast — training window aligned with Factor0
-                    if OOS_window == 'rolling':
-                        macro_train = MacroData.iloc[t_idx - OOS_window_specs : t_idx]
-                    else:  # recursive
-                        macro_train = MacroData.iloc[:t_idx]
-                    lamt_mac, mac_train_fitted, _sel = self._dispatch_macro_predict(
-                        Factor0, macro_train, MacroData.loc[t],
-                        regularization, target_variance, alpha,
-                        pass2_intercept,
-                        return_train_fitted=True,
-                        return_selected=True,
-                        ridge_df=ridge_df)  # (KM,), (KM, T_train), selected_info|None
-                    LambdaM[t] = lamt_mac
-                    if _sel is not None:
-                        lasso_sel_list.append((t, _sel))
-
-                    # (c) OLS combination — expanding window over past OOS history
-                    n_hist = len(oos_fac_hist)
-                    if n_hist >= _min_combo:
-                        lamt = self._combine_forecasts_oos(
-                            np.array(oos_fac_hist).T,   # (KM, n_hist)
-                            np.array(oos_var_hist).T,   # (KM, n_hist)
-                            np.array(oos_mac_hist).T,   # (KM, n_hist)
-                            lamt_var, lamt_mac)
+                    B_l        = self._VARB(X=Factor0_l)
+                    lamt_var_l = B_l.T.dot(
+                        np.hstack((Factor0_l[:, -1], 1)).reshape(-1, 1)).ravel()
+                    mac_tr_l   = (MacroData.iloc[t_idx_l - OOS_window_specs : t_idx_l]
+                                  if OOS_window == 'rolling' else MacroData.iloc[:t_idx_l])
+                    lamt_mac_l, mac_fit_l, sel_l = self._dispatch_macro_predict(
+                        Factor0_l, mac_tr_l, MacroData.loc[t],
+                        regularization, target_variance, alpha, pass2_intercept,
+                        return_train_fitted=True, return_selected=True, ridge_df=ridge_df)
+                    fac_s, var_s, mac_s = fc_snap
+                    n_h = len(fac_s)
+                    if n_h >= _min_combo:
+                        lamt_l = self._combine_forecasts_oos(
+                            np.array(fac_s).T, np.array(var_s).T, np.array(mac_s).T,
+                            lamt_var_l, lamt_mac_l)
                     else:
-                        # equal-weight fallback during burn-in
-                        lamt = 0.5 * lamt_var + 0.5 * lamt_mac
-
-                    Lambda[t] = lamt
-
-                    # Update histories after forecast is made and F_t is observed
-                    oos_var_hist.append(lamt_var.copy())
-                    oos_mac_hist.append(lamt_mac.copy())
-                    oos_fac_hist.append(F_t.copy())
-
-                    # Combined training fitted values for TanPtf residual covariance:
-                    # VAR1 training fitted (matrix multiply, no re-fitting)
+                        lamt_l = 0.5 * lamt_var_l + 0.5 * lamt_mac_l
                     if K_tan > 0:
-                        T_tr = Factor0.shape[1]
-                        Ftil = np.vstack([Factor0, np.ones((1, T_tr))])  # (KM+1, T_tr)
-                        var_train = np.empty_like(Factor0)
-                        var_train[:, 0]  = Factor0.mean(axis=1)
-                        var_train[:, 1:] = B.T @ Ftil[:, :-1]           # (KM, T_tr-1)
-                        # OLS combination over training window
-                        _combo_train = np.zeros_like(Factor0)
+                        T_tr_l   = Factor0_l.shape[1]
+                        Ftil_l   = np.vstack([Factor0_l, np.ones((1, T_tr_l))])
+                        vtr_l    = np.empty_like(Factor0_l)
+                        vtr_l[:, 0]  = Factor0_l.mean(axis=1)
+                        vtr_l[:, 1:] = B_l.T @ Ftil_l[:, :-1]
+                        ctr_l    = np.zeros_like(Factor0_l)
                         for _k in range(KM):
-                            _Xc = np.column_stack([
-                                np.ones(T_tr), var_train[_k, :], mac_train_fitted[_k, :]])
-                            _wc = np.linalg.lstsq(_Xc, Factor0[_k, :], rcond=None)[0]
-                            _combo_train[_k, :] = _Xc @ _wc
-                        mu_train_tan = _combo_train[:K_tan, :]
+                            _Xc = np.column_stack(
+                                [np.ones(T_tr_l), vtr_l[_k, :], mac_fit_l[_k, :]])
+                            ctr_l[_k, :] = _Xc @ np.linalg.lstsq(
+                                _Xc, Factor0_l[_k, :], rcond=None)[0]
+                        mu_train_tan_l = ctr_l[:K_tan, :]
 
                 elif factor_mean == 'macro':
-                    # Macro-only: no VAR(1), no combination step
-                    if OOS_window == 'rolling':
-                        macro_train = MacroData.iloc[t_idx - OOS_window_specs : t_idx]
-                    else:  # recursive
-                        macro_train = MacroData.iloc[:t_idx]
-                    lamt, mac_train_fitted, _sel = self._dispatch_macro_predict(
-                        Factor0, macro_train, MacroData.loc[t],
-                        regularization, target_variance, alpha,
-                        pass2_intercept,
-                        return_train_fitted=True,
-                        return_selected=True,
-                        ridge_df=ridge_df)  # (KM,), (KM, T_train), selected_info|None
-                    if _sel is not None:
-                        lasso_sel_list.append((t, _sel))
-                    Lambda[t]  = lamt
-                    LambdaM[t] = lamt
-                    # B stays None — no VAR component
+                    mac_tr_l = (MacroData.iloc[t_idx_l - OOS_window_specs : t_idx_l]
+                                if OOS_window == 'rolling' else MacroData.iloc[:t_idx_l])
+                    lamt_l, mac_fit_l, sel_l = self._dispatch_macro_predict(
+                        Factor0_l, mac_tr_l, MacroData.loc[t],
+                        regularization, target_variance, alpha, pass2_intercept,
+                        return_train_fitted=True, return_selected=True, ridge_df=ridge_df)
                     if K_tan > 0:
-                        mu_train_tan = mac_train_fitted[:K_tan, :]
+                        mu_train_tan_l = mac_fit_l[:K_tan, :]
 
-                fittedX['Fits_Pred'][t] = (Wt @ Gamma0 @ lamt).reshape(-1, 1)
+                fits_pred_l = (Wt_l @ Gamma0_l @ lamt_l).reshape(-1, 1)
+                TanPtf_l    = (self._tangency_ptf(
+                                   Factor0_l[:K_tan, :], F_t_l[:K_tan], tan_target_vol,
+                                   mu=lamt_l[:K_tan], mu_train=mu_train_tan_l)
+                               if K_tan > 0 else np.nan)
 
-                # TanPtf: tangency portfolio using lamt as the expected-return vector
-                # so that time-varying factor predictions (VAR1, macro, forecombo) drive
-                # the weights rather than the static training-window mean.
-                # S is estimated from prediction residuals (mu_train_tan) so that the
-                # conditional covariance Cov(F - mu) is used, not Cov(F).
-                if K_tan > 0:
-                    TanPtf[t] = self._tangency_ptf(
-                        Factor0[:K_tan, :], F_t[:K_tan], tan_target_vol,
-                        mu=lamt[:K_tan], mu_train=mu_train_tan)
-
+                benchX_l = benchR_l = None
                 if R2_bench == 'mean':
-                    # per-characteristic mean of _X up to (not including) t
-                    benchX[t] = X_cumsum[:, t_idx - 1] / X_cumcnt[t_idx - 1]
+                    benchX_l = X_cumsum[:, t_idx_l - 1] / X_cumcnt[t_idx_l - 1]
                 elif R2_bench == 'pooled_mean':
-                    # grand mean of _X up to (not including) t
-                    benchX[t] = X_cumsum[t_idx - 1] / X_cumcnt[t_idx - 1]
+                    benchX_l = X_cumsum[t_idx_l - 1] / X_cumcnt[t_idx_l - 1]
+                Betat_l = self._compute_beta(t, Gamma0_l) if (Rdo or Betado) else None
+                if Rdo and R2_bench in ('mean', 'pooled_mean'):
+                    benchR_l = R_cumsum_arr[t_idx_l - 1] / R_cumcnt_arr[t_idx_l - 1]
 
-                if Rdo or Betado:
-                    Betat = self._compute_beta(t, Gamma0)  # (N_t, KM)
+                return {'Gamma0': Gamma0_l, 'Factor0': Factor0_l,
+                        'F_t': F_t_l, 'lamt': lamt_l,
+                        'lamt_mac': lamt_mac_l, 'lamt_var': lamt_var_l, 'B': B_l,
+                        'fits_total': fits_total_l, 'fits_pred': fits_pred_l,
+                        'TanPtf': TanPtf_l, 'ArbPtf': ArbPtf_l,
+                        'Betat': Betat_l, 'benchX': benchX_l, 'benchR': benchR_l,
+                        'sel': sel_l, 'tol': tol_l, 'iters': iters_l, 'time': time_l}
+
+            # ------------------------------------------------------------------
+            # Chunked parallel dispatch
+            # ------------------------------------------------------------------
+            ct = 0
+            B = None   # updated each period; used in Lambda_dict at assembly
+            OOS_dates = self.Dates[OOS_window_specs:]
+
+            for chunk_start in range(0, len(OOS_dates), _chunk_sz):
+                chunk = OOS_dates[chunk_start : chunk_start + _chunk_sz]
+
+                # Snapshot forecombo histories at the chunk boundary (read-only
+                # inside each parallel call; updated sequentially after the chunk).
+                fc_snap = ((list(oos_fac_hist), list(oos_var_hist), list(oos_mac_hist))
+                           if factor_mean == 'forecombo' else ([], [], []))
+
+                chunk_res = Parallel(n_jobs=oos_n_jobs, prefer='threads')(
+                    delayed(_one_period)(t, Gamma0.copy(), fc_snap) for t in chunk)
+
+                for t, res in zip(chunk, chunk_res):
+                    numerical_stats['tol'][t]    = res['tol']
+                    numerical_stats['iters'][t]  = res['iters']
+                    numerical_stats['time'][t]   = res['time']
+                    Gamma.loc[t]                 = res['Gamma0']
+                    Factor[t]                    = res['F_t']
+                    Lambda[t]                    = res['lamt']
+                    fittedX['Fits_Total'][t]     = res['fits_total']
+                    fittedX['Fits_Pred'][t]      = res['fits_pred']
+                    TanPtf[t]                    = res['TanPtf']
+                    B                            = res['B']
+                    if has_const:
+                        ArbPtf[t]               = res['ArbPtf']
+                    if factor_mean == 'forecombo':
+                        LambdaM[t]              = res['lamt_mac']
+                        # Update histories in chronological order after the chunk
+                        oos_var_hist.append(res['lamt_var'].copy())
+                        oos_mac_hist.append(res['lamt_mac'].copy())
+                        oos_fac_hist.append(res['F_t'].copy())
+                    elif factor_mean == 'macro':
+                        LambdaM[t]              = res['lamt']
+                    if res['sel'] is not None:
+                        lasso_sel_list.append((t, res['sel']))
+                    if res['benchX'] is not None:
+                        benchX[t]               = res['benchX']
                     if Rdo:
-                        fittedR['Fits_Total'].loc[t] = Betat.dot(F_t).reshape(-1, 1)
-                        fittedR['Fits_Pred'].loc[t] = Betat.dot(lamt).reshape(-1, 1)
+                        _Bt = res['Betat']
+                        fittedR['Fits_Total'].loc[t] = _Bt.dot(res['F_t']).reshape(-1, 1)
+                        fittedR['Fits_Pred'].loc[t]  = _Bt.dot(res['lamt']).reshape(-1, 1)
                         if R2_bench in ('mean', 'pooled_mean'):
-                            # mean of R up to (not including) t
-                            benchR.loc[t] = R_cumsum_arr[t_idx - 1] / R_cumcnt_arr[t_idx - 1]
+                            benchR.loc[t]       = res['benchR']
                         if Betado:
-                            fittedBeta.loc[t] = Betat
+                            fittedBeta.loc[t]   = _Bt
                     elif Betado:
-                        fittedBeta.loc[t] = Betat
+                        fittedBeta.loc[t]       = res['Betat']
+                    ct += 1
+                    if dispIters and ct % 12 == 0:
+                        print('%s done: %i iters, %.2f sec'
+                              % (t, res['iters'], res['time']))
 
-                # Extend Factor0 for the next iteration's tolerance check.
-                # Rolling: slide window (drop oldest column, append placeholder zero).
-                # Recursive: append placeholder zero column.
-                if OOS_window == 'rolling':
-                    Factor0 = np.concatenate(
-                        (Factor0[:, 1:], np.zeros((Factor0.shape[0], 1))), axis=1)
-                else:
-                    Factor0 = np.concatenate(
-                        (Factor0, np.zeros((Factor0.shape[0], 1))), axis=1)
-
-                ct += 1
-                if dispIters and ct % 12 == 0:
-                    print('%s done: %i iters, %.2f sec'
-                          % (t, numerical_stats['iters'][t].values[0],
-                             numerical_stats['time'][t].values[0]))
+                # Refresh Gamma warm-start from the last period in the chunk
+                Gamma0 = chunk_res[-1]['Gamma0']
 
             # Build lasso_selected DataFrame from per-period accumulation.
             # Shape: (KM, T_oos) with columns=OOS_dates, index=Factor_names.
