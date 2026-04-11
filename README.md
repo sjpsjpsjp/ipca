@@ -242,8 +242,8 @@ sharpe = TanPtf.mean() / TanPtf.std()
 ### ArbPtf — arbitrage portfolio
 
 Populated when `gFac` contains a constant row (value = 1). Computes
-`GammaAlpha' W_t^{-1} X_t` at each period — the GLS-weighted managed
-portfolio associated with the constant factor's loading.
+`GammaAlpha' W_t^{-1} X_t` at each period — the managed
+portfolio associated with a constant factor.
 
 ```python
 results = model.fit(K=3, gFac=gFac_with_const_row)
