@@ -924,11 +924,60 @@ class ipca(object):
             B = None   # updated each period; used in Lambda_dict at assembly
             OOS_dates = self.Dates[OOS_window_specs:]
 
-            for chunk_start in range(0, len(OOS_dates), _chunk_sz):
-                chunk = OOS_dates[chunk_start : chunk_start + _chunk_sz]
+            def _store_result(t, res):
+                """Assemble one period's results into the output containers."""
+                nonlocal B, ct
+                numerical_stats['tol'][t]    = res['tol']
+                numerical_stats['iters'][t]  = res['iters']
+                numerical_stats['time'][t]   = res['time']
+                Gamma.loc[t]                 = res['Gamma0']
+                Factor[t]                    = res['F_t']
+                Lambda[t]                    = res['lamt']
+                fittedX['Fits_Total'][t]     = res['fits_total']
+                fittedX['Fits_Pred'][t]      = res['fits_pred']
+                TanPtf[t]                    = res['TanPtf']
+                B                            = res['B']
+                if has_const:
+                    ArbPtf[t]               = res['ArbPtf']
+                if factor_mean == 'forecombo':
+                    LambdaM[t]              = res['lamt_mac']
+                    oos_var_hist.append(res['lamt_var'].copy())
+                    oos_mac_hist.append(res['lamt_mac'].copy())
+                    oos_fac_hist.append(res['F_t'].copy())
+                elif factor_mean == 'macro':
+                    LambdaM[t]              = res['lamt']
+                if res['sel'] is not None:
+                    lasso_sel_list.append((t, res['sel']))
+                if res['benchX'] is not None:
+                    benchX[t]               = res['benchX']
+                if Rdo:
+                    _Bt = res['Betat']
+                    fittedR['Fits_Total'].loc[t] = _Bt.dot(res['F_t']).reshape(-1, 1)
+                    fittedR['Fits_Pred'].loc[t]  = _Bt.dot(res['lamt']).reshape(-1, 1)
+                    if R2_bench in ('mean', 'pooled_mean'):
+                        benchR.loc[t]       = res['benchR']
+                    if Betado:
+                        fittedBeta.loc[t]   = _Bt
+                elif Betado:
+                    fittedBeta.loc[t]       = res['Betat']
+                ct += 1
+                if dispIters and ct % 12 == 0:
+                    print('%s done: %i iters, %.2f sec'
+                          % (t, res['iters'], res['time']))
 
-                # Snapshot forecombo histories at the chunk boundary (read-only
-                # inside each parallel call; updated sequentially after the chunk).
+            # Run the first OOS period solo to converge the warm start
+            # from the IS Gamma0 before parallelising the rest.
+            _first_t = OOS_dates[0]
+            fc_snap = ((list(oos_fac_hist), list(oos_var_hist), list(oos_mac_hist))
+                       if factor_mean == 'forecombo' else ([], [], []))
+            _first_res = _one_period(_first_t, Gamma0.copy(), fc_snap)
+            Gamma0 = _first_res['Gamma0']
+            _store_result(_first_t, _first_res)
+
+            remaining_dates = OOS_dates[1:]
+            for chunk_start in range(0, len(remaining_dates), _chunk_sz):
+                chunk = remaining_dates[chunk_start : chunk_start + _chunk_sz]
+
                 fc_snap = ((list(oos_fac_hist), list(oos_var_hist), list(oos_mac_hist))
                            if factor_mean == 'forecombo' else ([], [], []))
 
@@ -936,44 +985,7 @@ class ipca(object):
                     delayed(_one_period)(t, Gamma0.copy(), fc_snap) for t in chunk)
 
                 for t, res in zip(chunk, chunk_res):
-                    numerical_stats['tol'][t]    = res['tol']
-                    numerical_stats['iters'][t]  = res['iters']
-                    numerical_stats['time'][t]   = res['time']
-                    Gamma.loc[t]                 = res['Gamma0']
-                    Factor[t]                    = res['F_t']
-                    Lambda[t]                    = res['lamt']
-                    fittedX['Fits_Total'][t]     = res['fits_total']
-                    fittedX['Fits_Pred'][t]      = res['fits_pred']
-                    TanPtf[t]                    = res['TanPtf']
-                    B                            = res['B']
-                    if has_const:
-                        ArbPtf[t]               = res['ArbPtf']
-                    if factor_mean == 'forecombo':
-                        LambdaM[t]              = res['lamt_mac']
-                        # Update histories in chronological order after the chunk
-                        oos_var_hist.append(res['lamt_var'].copy())
-                        oos_mac_hist.append(res['lamt_mac'].copy())
-                        oos_fac_hist.append(res['F_t'].copy())
-                    elif factor_mean == 'macro':
-                        LambdaM[t]              = res['lamt']
-                    if res['sel'] is not None:
-                        lasso_sel_list.append((t, res['sel']))
-                    if res['benchX'] is not None:
-                        benchX[t]               = res['benchX']
-                    if Rdo:
-                        _Bt = res['Betat']
-                        fittedR['Fits_Total'].loc[t] = _Bt.dot(res['F_t']).reshape(-1, 1)
-                        fittedR['Fits_Pred'].loc[t]  = _Bt.dot(res['lamt']).reshape(-1, 1)
-                        if R2_bench in ('mean', 'pooled_mean'):
-                            benchR.loc[t]       = res['benchR']
-                        if Betado:
-                            fittedBeta.loc[t]   = _Bt
-                    elif Betado:
-                        fittedBeta.loc[t]       = res['Betat']
-                    ct += 1
-                    if dispIters and ct % 12 == 0:
-                        print('%s done: %i iters, %.2f sec'
-                              % (t, res['iters'], res['time']))
+                    _store_result(t, res)
 
                 # Refresh Gamma warm-start from the last period in the chunk
                 Gamma0 = chunk_res[-1]['Gamma0']
