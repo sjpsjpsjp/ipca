@@ -280,8 +280,11 @@ class ipca(object):
             factor_mean options. Raise OOS_window_specs or pass min_train_periods explicitly to
             override the auto-computed floor.
 
-        kappa_max : float : maximum acceptable condition number for the K×K Factor-step lhs matrix
-            GammaF.T @ W_t @ GammaF in the ALS. Default 1e8.
+        kappa_max : float : maximum acceptable condition number for linear systems in the ALS.
+            Applied to both the (K×K) per-period Factor step (GammaF.T @ W_t @ GammaF) and the
+            (L*KM × L*KM) Gamma step. When the condition number exceeds kappa_max, the minimum
+            adaptive ridge penalty is added: l = max(0, (σ_max − kappa_max·σ_min)/(kappa_max − 1)).
+            Default 1e8.
 
         const_tol : float : relative standard-deviation threshold (std / |mean|) used to detect a
             constant row in gFac. A row is considered constant when rel_std < const_tol AND its mean
@@ -1217,11 +1220,11 @@ class ipca(object):
         Gamma0    : (L, KM) ndarray
         gFac_arr  : (M, T) ndarray or None
         date_ints : 1-D integer array of time indices into self._W, self._X, self._Nts_arr
-        kappa_max : float — maximum acceptable condition number for the K×K Factor-step
-                    lhs matrix GammaF.T @ W_t @ GammaF.  For each period where the
-                    condition number exceeds kappa_max (e.g. because W_t is rank-deficient
-                    and GammaF intersects its null space), the minimum ridge penalty l is
-                    added: l = max(0, (σ_max − kappa_max·σ_min) / (kappa_max − 1)).
+        kappa_max : float — maximum acceptable condition number for both the (K×K)
+                    per-period Factor step (GammaF.T @ W_t @ GammaF) and the (L*KM × L*KM)
+                    Gamma step. When the condition number exceeds kappa_max, the minimum
+                    adaptive ridge penalty l is added:
+                    l = max(0, (σ_max − kappa_max·σ_min) / (kappa_max − 1)).
                     Default 1e8.  Must be > 1.
 
         Returns
@@ -1295,8 +1298,15 @@ class ipca(object):
         denom = np.einsum('ijt,kt,lt,t->ikjl', W_sub, Factor, Factor, N_sub)     # (L,K,L,K)
         denom = denom.reshape(self.L * KM, self.L * KM)
 
+        # Adaptive ridge: minimum l s.t. cond(denom + l*I) <= kappa_max
+        eigs_G    = np.linalg.eigvalsh(denom)
+        l_ridge_G = max(0.0,
+                        (eigs_G[-1] - kappa_max * eigs_G[0]) / (kappa_max - 1))
+        if l_ridge_G > 0.0:
+            denom += l_ridge_G * np.eye(self.L * KM)
+
         Gamma1 = np.reshape(
-            sla.lstsq(denom, numer, check_finite=False, overwrite_a=True, overwrite_b=True)[0],
+            np.linalg.solve(denom, numer),
             (self.L, KM))
 
         # ------ Step 3: normalisation ------

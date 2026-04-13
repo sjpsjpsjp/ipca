@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ipca"
-version = "2.0.3"
+version = "2.1.0"
 description = "Instrumented Principal Components Analysis (Kelly, Pruitt, and Su 2019)"
 readme = "README.md"
 authors = [{ name = "Seth Pruitt" }]
