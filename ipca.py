@@ -446,6 +446,14 @@ class ipca(object):
 
             Gamma = pd.DataFrame(data=Gamma_arr, index=self.Chars, columns=Factor_names)
             GV = Gamma_arr  # (L, KM) ndarray alias
+            T = len(self.Dates)
+
+            # Sentinels — declared up front so static analysis sees them as
+            # always bound. Overwritten by the relevant factor_mean branch:
+            #   lamt_const : set in the 'constant' branch below
+            #   LambdaV    : set later for 'VAR1' / 'macro' / 'forecombo'
+            lamt_const = np.zeros(KM)
+            LambdaV    = np.zeros((KM, T))
 
             # --- build Lambda ---
             if factor_mean == 'constant':
@@ -470,11 +478,6 @@ class ipca(object):
 
             Factor = pd.DataFrame(data=Factor_arr, index=Factor_names, columns=self.Dates)
             FV = Factor_arr  # (KM, T) ndarray alias
-            T = len(self.Dates)
-            # Sentinels — overwritten by their respective factor_mean branches below;
-            # declared here so static analysis sees them as always bound.
-            lamt_const = np.zeros(KM)       # overwritten when factor_mean == 'constant'
-            LambdaV    = np.zeros((KM, T))  # overwritten for VAR1 / macro / forecombo
 
             # lasso_selected: populated for regularization='lasso' (IS); None otherwise.
             lasso_selected = None
