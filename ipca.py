@@ -2,7 +2,7 @@
 IPCA: Instrumented Principal Components Analysis
 Estimation class for Kelly, Pruitt, and Su (2019 JFE)
 
-version 2.0.2
+version 2.1.1
 
 copyright Seth Pruitt (2020-2026)
 """
@@ -1235,10 +1235,23 @@ class ipca(object):
         Gamma1  : (L, KM) ndarray
         Factor1 : (KM, len(date_ints)) ndarray
         """
-        W_sub  = self._W[:, :, date_ints]      # (L, L, T_sub)
-        X_sub  = self._X[:, date_ints]         # (L, T_sub)
-        N_sub  = self._Nts_arr[date_ints]      # (T_sub,)
-        T_sub  = len(date_ints)
+        # ---- Hoist date subset: use slice views when date_ints is contiguous ----
+        # All three call sites (IS, OOS init, OOS recursive/rolling) pass
+        # np.arange(...), so the contiguous branch is the common case.
+        T_sub = len(date_ints)
+        if (T_sub > 0
+                and int(date_ints[T_sub - 1] - date_ints[0]) + 1 == T_sub):
+            sl       = slice(int(date_ints[0]), int(date_ints[T_sub - 1]) + 1)
+            W_sub    = self._W[:, :, sl]                    # view, no copy
+            X_sub    = self._X[:, sl]
+            N_sub    = self._Nts_arr[sl]
+            gFac_sub = gFac_arr[:, sl] if gFac_arr is not None else None
+        else:
+            W_sub    = self._W[:, :, date_ints]             # (L, L, T_sub) copy
+            X_sub    = self._X[:, date_ints]
+            N_sub    = self._Nts_arr[date_ints]
+            gFac_sub = (gFac_arr[:, date_ints]
+                        if gFac_arr is not None else None)
 
         if K == KM:
             GammaF = Gamma0
@@ -1252,37 +1265,37 @@ class ipca(object):
 
         # ------ Step 1: estimate latent factors (vectorised + adaptive ridge) ------
         if K > 0:
+            # Batched-BLAS view of W: (T_sub, L, L)
+            W_perm = W_sub.transpose(2, 0, 1)
+
             # RHS: GammaF.T @ (X[:,t] - W[:,:,t] @ GammaG @ gFac[:,t])  for all t
             if M > 0:
-                gFac_sub = gFac_arr[:, date_ints]              # (M, T_sub)
-                GG_fac   = GammaG @ gFac_sub                   # (L, T_sub)
-                WGG      = np.einsum('ijt,jt->it',
-                                     W_sub, GG_fac)            # (L, T_sub)
-                rhs_all  = GammaF.T @ (X_sub - WGG)           # (K, T_sub)
+                assert GammaG is not None and gFac_sub is not None  # M > 0 invariant
+                GG_fac  = GammaG @ gFac_sub                            # (L, T_sub)
+                # WGG[i,t] = sum_j W[i,j,t] * GG_fac[j,t]  via batched matvec
+                WGG     = (W_perm @ GG_fac.T[:, :, None])[..., 0].T    # (L, T_sub)
+                rhs_all = GammaF.T @ (X_sub - WGG)                     # (K, T_sub)
             else:
-                rhs_all  = GammaF.T @ X_sub                    # (K, T_sub)
+                rhs_all = GammaF.T @ X_sub                             # (K, T_sub)
 
-            # LHS: GammaF.T @ W[:,:,t] @ GammaF  for all t
-            WG      = np.einsum('ijt,jk->ikt', W_sub, GammaF)  # (L, K, T_sub)
-            lhs_all = np.einsum('li,ljt->ijt', GammaF, WG)     # (K, K, T_sub)
-
-            # Reshape to leading batch dimension for LAPACK broadcasting
-            lhs_T = lhs_all.transpose(2, 0, 1)                 # (T_sub, K, K)
-            rhs_T = rhs_all.T[:, :, None]                      # (T_sub, K, 1)
+            # LHS: GammaF.T @ W[:,:,t] @ GammaF  for all t — chained batched matmul
+            WG_perm = W_perm @ GammaF                                  # (T_sub, L, K)
+            lhs_T   = GammaF.T @ WG_perm                               # (T_sub, K, K)
+            rhs_T   = rhs_all.T[:, :, None]                            # (T_sub, K, 1)
 
             # Adaptive ridge: minimum l per period s.t. cond(lhs + l*I) <= kappa_max
             # l = max(0,  (sigma_max - kappa_max * sigma_min) / (kappa_max - 1))
-            eigs      = np.linalg.eigvalsh(lhs_T)              # (T_sub, K), ascending
-            sigma_min = eigs[:, 0]                              # (T_sub,)
-            sigma_max = eigs[:, -1]                             # (T_sub,)
+            eigs      = np.linalg.eigvalsh(lhs_T)
+            sigma_min = eigs[:, 0]
+            sigma_max = eigs[:, -1]
             l_ridge   = np.maximum(
                 0.0,
                 (sigma_max - kappa_max * sigma_min) / (kappa_max - 1)
-            )                                                   # (T_sub,)
-            lhs_T = lhs_T + l_ridge[:, None, None] * np.eye(K) # (T_sub, K, K)
+            )
+            lhs_T = lhs_T + l_ridge[:, None, None] * np.eye(K)
 
             # Batched solve — well-conditioned by construction
-            FactorF = np.linalg.solve(lhs_T, rhs_T)[..., 0].T  # (K, T_sub)
+            FactorF = np.linalg.solve(lhs_T, rhs_T)[..., 0].T          # (K, T_sub)
         else:
             FactorF = None
 
@@ -1290,27 +1303,39 @@ class ipca(object):
         if K == KM:
             Factor = FactorF
         elif M == KM:
-            Factor = gFac_arr[:, date_ints]
+            Factor = gFac_sub
         else:
-            Factor = np.concatenate((FactorF, gFac_arr[:, date_ints]), axis=0)
+            Factor = np.concatenate((FactorF, gFac_sub), axis=0)
 
         # ------ Step 2: estimate Gamma (vectorised) ------
-        # numer[i, k] = sum_t N_t * X[i,t] * F[k,t]
-        numer = np.einsum('it,kt,t->ik', X_sub, Factor, N_sub).ravel()           # (L*KM,)
+        assert Factor is not None  # invariant: KM >= 1 ⇒ Factor is assigned above
+        # Share Factor * N_sub between numer and FF.
+        F_w   = Factor * N_sub                                                    # (KM, T_sub)
+        numer = (X_sub @ F_w.T).ravel()                                           # (L*KM,)
+
         # denom[i,k,j,l] = sum_t N_t * W[i,j,t] * F[k,t] * F[l,t]
-        denom = np.einsum('ijt,kt,lt,t->ikjl', W_sub, Factor, Factor, N_sub)     # (L,K,L,K)
-        denom = denom.reshape(self.L * KM, self.L * KM)
+        # Kronecker-structured contraction → single BLAS gemm.
+        FF    = Factor[:, None, :] * F_w[None, :, :]                              # (KM, KM, T_sub)
+        denom = (W_sub.reshape(self.L * self.L, T_sub)
+                 @ FF.reshape(KM * KM, T_sub).T)                                  # (L*L, KM*KM)
+        denom = (denom.reshape(self.L, self.L, KM, KM)
+                      .transpose(0, 2, 1, 3)
+                      .reshape(self.L * KM, self.L * KM))
 
-        # Adaptive ridge: minimum l s.t. cond(denom + l*I) <= kappa_max
-        eigs_G    = np.linalg.eigvalsh(denom)
-        l_ridge_G = max(0.0,
-                        (eigs_G[-1] - kappa_max * eigs_G[0]) / (kappa_max - 1))
-        if l_ridge_G > 0.0:
-            denom += l_ridge_G * np.eye(self.L * KM)
-
-        Gamma1 = np.reshape(
-            np.linalg.solve(denom, numer),
-            (self.L, KM))
+        # Cholesky fast path: succeeds whenever denom is positive-definite (the
+        # common case once Gamma stabilises). Fall back to adaptive ridge only
+        # on numerical failure.
+        try:
+            c_factor = sla.cho_factor(denom, lower=False, check_finite=False)
+            Gamma1   = sla.cho_solve(c_factor, numer, check_finite=False
+                                     ).reshape(self.L, KM)
+        except np.linalg.LinAlgError:
+            eigs_G    = np.linalg.eigvalsh(denom)
+            l_ridge_G = max(0.0,
+                            (eigs_G[-1] - kappa_max * eigs_G[0]) / (kappa_max - 1))
+            if l_ridge_G > 0.0:
+                denom += l_ridge_G * np.eye(self.L * KM)
+            Gamma1 = np.linalg.solve(denom, numer).reshape(self.L, KM)
 
         # ------ Step 3: normalisation ------
         if K > 0:
